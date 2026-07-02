@@ -31,15 +31,24 @@
 //     ListLoad/ListLoadNext (e.g. by another plugin or a custom TC command)
 //     to open directly at page N. A real file that happens to be named that
 //     way on disk always takes precedence over the heuristic.
-//   - Forwards Lister's Find / Copy / zoom toolbar actions and the Lister
-//     search dialog (ListSearchTextW) into Sumatra's own find bar, clipboard
-//     copy, and zoom.
+//   - Implements the real ListSendCommand set (LC_COPY, LC_NEWPARAMS,
+//     LC_SELECTALL, LC_SETPERCENT), ListSearchText[W] with its real
+//     LCS_FINDFIRST/LCS_MATCHCASE/LCS_WHOLEWORDS/LCS_BACKWARDS flags, and
+//     ListSearchDialog -- forwarding find/copy/select-all/scroll into
+//     Sumatra's own UI. Page navigation, zoom, and general keyboard input
+//     reach Sumatra directly once its window has focus and need no explicit
+//     forwarding.
 //   - File-list thumbnails (ListGetPreviewBitmap[W]) via the Windows Shell
 //     thumbnail pipeline -- no extra Sumatra process spawned per thumbnail.
-//   - Non-interactive printing (ListPrint[W]) via Sumatra's -print-to /
-//     -print-to-default CLI switches.
+//   - Printing (ListPrint[W]): shows Sumatra's own native print dialog when
+//     reusing a live embedded pane for the file being printed, falling back
+//     to non-interactive CLI printing (-print-to/-print-to-default)
+//     otherwise.
 //   - Auto night mode: with AutoNightMode=1, follows Total Commander's own
-//     Lister background colour (light/dark) instead of a fixed setting.
+//     Lister dark-mode state (via the real LC_NEWPARAMS/LCP_DARKMODE
+//     mechanism) instead of a fixed setting.
+//   - Quick View Panel (Ctrl+Q) focus notification (ITM_FOCUS), so its
+//     header highlights correctly when the embedded pane gains focus.
 //   - Optional pop-out hotkey (EnablePopOut=1, off by default): Ctrl+Alt+O
 //     reopens the current file in a normal, full SumatraPDF window with its
 //     menu/toolbar, for actions the embedded view doesn't expose (Save As,
@@ -51,6 +60,16 @@
 //     "next file" navigation) instead of recreating the host window.
 //   - Optional debug log (SumatraLister.log next to the DLL, auto-rotated
 //     past ~2MB) for troubleshooting detection/launch problems.
+//
+//  API correctness
+//  ----------------
+//  The WLX constants and struct layouts used in this file (LC_*, LCP_*,
+//  LCS_*, ITM_FOCUS, ListDefaultParamStruct, and every exported function's
+//  exact signature including ListPrint's RECT* Margins) have been verified
+//  against the official Total Commander Lister Plugin SDK
+//  (https://github.com/ghisler/WLX-SDK). See README.md's "API correctness"
+//  section for the full account of what an earlier, unverified version of
+//  this file got wrong and what changed as a result.
 //
 //  Thread safety
 //  -------------
@@ -87,6 +106,7 @@
 #include <mutex>
 #include <memory>
 #include <algorithm>     // std::min / std::max
+#include <cstdint>       // std::uint8_t
 #include <cstdio>
 #include <cstdarg>
 
@@ -98,34 +118,68 @@
 #pragma comment(lib, "gdi32.lib")
 
 // ---------------------------------------------------------------------------
-//  Minimal subset of the listplug.h / wlxplugin.h API (no SDK dependency)
+//  WLX API constants -- verified against the official Total Commander
+//  Lister Plugin SDK (https://github.com/ghisler/WLX-SDK,
+//  https://ghisler.github.io/WLX-SDK/listplug.h.htm), fetched and
+//  cross-checked against an independent mirror during development. These
+//  replace an earlier, unverified set of constants that did not match the
+//  real API; see README.md's "API correctness" section for what changed
+//  and why.
 // ---------------------------------------------------------------------------
 
 #define LISTPLUGIN_VERSION 0x1A0
 
-// ListLoad ShowFlags
-#define lcs_show_buttons   0x01
-#define lcs_show_browser   0x02
+// ListSendCommand commands (TC calls this "when the user changes some
+// options in Lister's menu" -- these four are the complete, real set).
+#define LC_COPY       1  // copy current selection to the clipboard
+#define LC_NEWPARAMS  2  // display options changed; Parameter is a combination of LCP_* flags below
+#define LC_SELECTALL  3  // select the whole contents
+#define LC_SETPERCENT 4  // scroll to a new position in the document, as a percent (Parameter = 0-100)
 
-// ListSendCommand commands
-#define LCS_REDRAW         1
-#define LCS_RESIZE         2
-#define LCS_NEXT           3
-#define LCS_PREV           4
-#define LCS_FIND           5
-#define LCS_FONT           6
-#define LCS_COPY           8
-#define LCS_BACKGND        9
-#define LCS_GETSIZE        12
-#define LCS_GETZOOMFACTOR  13
-#define LCS_SETZOOMFACTOR  14
-#define LCS_GETCURRENTPAGE 15
-#define LCS_GETPAGECOUNT   16
-#define LCS_SETPAGE        17
+// LC_NEWPARAMS flags (the Parameter passed alongside LC_NEWPARAMS).
+// This plugin only acts on LCP_DARKMODE/LCP_DARKMODENATIVE (for
+// AutoNightMode); the others describe TC's own built-in text/hex/image
+// viewer options, which don't apply to an embedded SumatraPDF view, and
+// per the SDK docs "you may ignore these parameters if they don't apply
+// to your document type."
+#define LCP_WRAPTEXT       1
+#define LCP_FITTOWINDOW    2
+#define LCP_ANSI           4
+#define LCP_ASCII          8
+#define LCP_VARIABLE       12
+#define LCP_FORCESHOW      16
+#define LCP_FITLARGERONLY  32
+#define LCP_CENTER         64
+#define LCP_DARKMODE       128  // added in WLX SDK 2.12 / TC 10.0 (2022)
+#define LCP_DARKMODENATIVE 256  // added in WLX SDK 2.12 / TC 10.0 (2022)
+
+// ListSearchText / ListSearchTextW SearchParameter flags.
+#define LCS_FINDFIRST  1  // fresh search from the top; unset means "find next" from current position
+#define LCS_MATCHCASE  2  // case-sensitive search (not currently translated -- see README)
+#define LCS_WHOLEWORDS 4  // whole-words-only search (not currently translated -- see README)
+#define LCS_BACKWARDS  8  // search backwards (upward) through the document
+
+// WM_COMMAND values the PLUGIN sends TO Total Commander's Lister/Quick-View
+// parent window (not the reverse). Confirmed via the WLX SDK changelog and
+// Total Commander's own "List of changes": sent as
+// WM_COMMAND(MAKEWPARAM(0, ITM_FOCUS), (LPARAM)pluginWindow) to notify the
+// Quick View Panel (Ctrl+Q) that this pane gained focus, so its header
+// highlights correctly.
+#define ITM_FOCUS 0xFFF8
 
 // return codes
 #define LISTPLUGIN_OK       0
 #define LISTPLUGIN_ERROR    1
+
+// Struct TC passes to ListSetDefaultParams, verified against the official
+// SDK (ghisler.github.io/WLX-SDK/listplug.h.htm). DefaultIniName is always
+// narrow (char[]), even in the Unicode/W-suffixed build.
+struct ListDefaultParamStruct {
+    int   size;
+    DWORD PluginInterfaceVersionLow;
+    DWORD PluginInterfaceVersionHi;
+    char  DefaultIniName[MAX_PATH];
+};
 
 // ---------------------------------------------------------------------------
 //  Config (SumatraLister.ini, same folder as the DLL)
@@ -597,8 +651,17 @@ static LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         }
         case WM_SETFOCUS: {
             ListerInstancePtr inst = FindInstance(hwnd);
-            if (inst && inst->sumatraWnd && IsWindow(inst->sumatraWnd))
-                SetFocus(inst->sumatraWnd);
+            if (inst) {
+                if (inst->sumatraWnd && IsWindow(inst->sumatraWnd))
+                    SetFocus(inst->sumatraWnd);
+                // Notify TC's Quick View Panel (Ctrl+Q) that this pane
+                // gained focus, so its header highlights correctly -- see
+                // ITM_FOCUS's definition near the top of this file for the
+                // verified source of this mechanism. Harmless no-op when
+                // this Lister window isn't inside a Quick View Panel.
+                if (inst->parentWin && IsWindow(inst->parentWin))
+                    PostMessageW(inst->parentWin, WM_COMMAND, MAKEWPARAM(0, ITM_FOCUS), (LPARAM)hwnd);
+            }
             return 0;
         }
         case WM_HOTKEY: {
@@ -1004,20 +1067,28 @@ static void EnsureErrorClassRegistered()
 //  window (i.e. Total Commander's Lister) to be the foreground window.
 // ---------------------------------------------------------------------------
 
-// Synthesizes a key-down sequence (optionally with Ctrl held) followed by
-// a matching key-up sequence, e.g. SendKeyCombo(true, 'F') == Ctrl+F.
-static void SendKeyCombo(bool ctrl, WORD vk)
+// Keyboard modifier for SendKeyCombo. A plain enum (not enum class) so the
+// call sites read naturally, e.g. SendKeyCombo(ModCtrl, 'F'); fixed to a
+// 1-byte underlying type since it only ever needs 3 values.
+enum KeyModifier : std::uint8_t { ModNone, ModCtrl, ModShift };
+
+// Synthesizes a key-down sequence (optionally with Ctrl or Shift held)
+// followed by a matching key-up sequence, e.g. SendKeyCombo(ModCtrl, 'F')
+// == Ctrl+F, SendKeyCombo(ModShift, VK_F3) == Shift+F3.
+static void SendKeyCombo(KeyModifier mod, WORD vk)
 {
+    WORD modVk = (mod == ModCtrl) ? VK_CONTROL : (mod == ModShift) ? VK_SHIFT : 0;
+
     INPUT down[2] = {};
     int   n = 0;
-    if (ctrl) { down[n].type = INPUT_KEYBOARD; down[n].ki.wVk = VK_CONTROL; n++; }
+    if (modVk) { down[n].type = INPUT_KEYBOARD; down[n].ki.wVk = modVk; n++; }
     down[n].type = INPUT_KEYBOARD; down[n].ki.wVk = vk; n++;
     SendInput(static_cast<UINT>(n), down, sizeof(INPUT)); // n is 1-2, bounded by the array size above
 
     INPUT up[2] = {};
     n = 0;
     up[n].type = INPUT_KEYBOARD; up[n].ki.wVk = vk; up[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
-    if (ctrl) { up[n].type = INPUT_KEYBOARD; up[n].ki.wVk = VK_CONTROL; up[n].ki.dwFlags = KEYEVENTF_KEYUP; n++; }
+    if (modVk) { up[n].type = INPUT_KEYBOARD; up[n].ki.wVk = modVk; up[n].ki.dwFlags = KEYEVENTF_KEYUP; n++; }
     SendInput(static_cast<UINT>(n), up, sizeof(INPUT)); // n is 1-2, bounded by the array size above
 }
 
@@ -1064,39 +1135,49 @@ static bool GetClipboardTextW(std::wstring& out)
     return ok;
 }
 
-// Opens Sumatra's find bar and (optionally) types/searches for `text`.
-static void ForwardFindToSumatra(ListerInstance* inst, const std::wstring* text)
+// Opens Sumatra's find bar and executes a search for `text`, honoring the
+// real LCS_BACKWARDS flag from SearchParameter for direction (F3/Shift+F3).
+// Always (re)pastes `text` into the find box before searching, even on a
+// "find next" call (LCS_FINDFIRST unset) -- this keeps Sumatra's find box
+// guaranteed in sync with whatever Total Commander currently considers the
+// search text to be, rather than assuming it's still there unchanged from
+// an earlier call, at the cost of a harmless redundant paste on repeats.
+static void ForwardFindToSumatra(ListerInstance* inst, const std::wstring& text, int searchFlags)
 {
-    if (!inst->sumatraWnd || !IsWindow(inst->sumatraWnd))
+    if (!inst->sumatraWnd || !IsWindow(inst->sumatraWnd) || text.empty())
         return;
 
+    bool backwards = (searchFlags & LCS_BACKWARDS) != 0;
+    // LCS_MATCHCASE / LCS_WHOLEWORDS are intentionally not translated here:
+    // this plugin doesn't have confirmed knowledge of Sumatra's exact find-
+    // bar hotkeys for toggling those specific options, and guessing risks
+    // silently toggling the wrong control instead. See README.
+
+    std::wstring savedClipboard;
+    bool hadClipboardText = GetClipboardTextW(savedClipboard);
+
     SetFocus(inst->sumatraWnd);
-    SendKeyCombo(true, 'F');     // Ctrl+F -> open Sumatra's find toolbar
+    SendKeyCombo(ModCtrl, 'F'); // Ctrl+F -> open/focus Sumatra's find toolbar
     Sleep(120);
 
-    if (text && !text->empty()) {
-        std::wstring savedClipboard;
-        bool hadClipboardText = GetClipboardTextW(savedClipboard);
-
-        SendKeyCombo(true, 'A'); // select any existing text in the find box
+    SendKeyCombo(ModCtrl, 'A'); // select any existing text in the find box
+    Sleep(30);
+    if (SetClipboardTextW(text)) {
+        SendKeyCombo(ModCtrl, 'V'); // paste search text
         Sleep(30);
-        if (SetClipboardTextW(*text)) {
-            SendKeyCombo(true, 'V'); // paste search text
-            Sleep(30);
-            SendKeyCombo(false, VK_RETURN); // execute search
+        SendKeyCombo(backwards ? ModShift : ModNone, VK_F3); // execute search in the requested direction
 
-            // Give Sumatra a moment to actually process the paste and the
-            // search before we touch the clipboard again -- restoring too
-            // early could overwrite our search text before Sumatra's own
-            // thread gets around to reading it, pasting stale content instead.
-            Sleep(50);
-            if (hadClipboardText)
-                SetClipboardTextW(savedClipboard);
-            // If there was nothing on the clipboard before (or it held a
-            // non-text format we don't track), we leave the search text in
-            // place rather than actively clearing it -- we only restore
-            // content we know we clobbered.
-        }
+        // Give Sumatra a moment to actually process the paste and the
+        // search before we touch the clipboard again -- restoring too
+        // early could overwrite our search text before Sumatra's own
+        // thread gets around to reading it, pasting stale content instead.
+        Sleep(50);
+        if (hadClipboardText)
+            SetClipboardTextW(savedClipboard);
+        // If there was nothing on the clipboard before (or it held a
+        // non-text format we don't track), we leave the search text in
+        // place rather than actively clearing it -- we only restore
+        // content we know we clobbered.
     }
 }
 
@@ -1105,23 +1186,45 @@ static void ForwardCopyToSumatra(ListerInstance* inst)
     if (!inst->sumatraWnd || !IsWindow(inst->sumatraWnd))
         return;
     SetFocus(inst->sumatraWnd);
-    SendKeyCombo(true, 'C'); // Ctrl+C -> copies current selection to clipboard
+    SendKeyCombo(ModCtrl, 'C'); // Ctrl+C -> copies current selection to clipboard
 }
 
-static void ForwardPageNav(ListerInstance* inst, bool next)
+// Real LC_SELECTALL command: select the whole document contents.
+static void ForwardSelectAllToSumatra(ListerInstance* inst)
 {
     if (!inst->sumatraWnd || !IsWindow(inst->sumatraWnd))
         return;
     SetFocus(inst->sumatraWnd);
-    SendKeyCombo(false, next ? VK_NEXT : VK_PRIOR); // Page Down / Page Up
+    SendKeyCombo(ModCtrl, 'A');
 }
 
-static void ForwardZoom(ListerInstance* inst, bool zoomIn)
+// Real LC_SETPERCENT command: scroll to a position in the document, given
+// as a percent (0-100). Sumatra has no message-based API to query total
+// page count, so translating an arbitrary percentage into an exact target
+// page isn't possible without risking a silently wrong jump. The two
+// unambiguous boundary cases are handled precisely via Sumatra's own
+// Ctrl+Home/Ctrl+End; everything in between is a documented no-op rather
+// than a guess.
+static void ForwardSetPercentToSumatra(ListerInstance* inst, int percent)
 {
     if (!inst->sumatraWnd || !IsWindow(inst->sumatraWnd))
         return;
     SetFocus(inst->sumatraWnd);
-    SendKeyCombo(true, zoomIn ? VK_OEM_PLUS : VK_OEM_MINUS); // Ctrl+'+' / Ctrl+'-'
+    if (percent <= 1)
+        SendKeyCombo(ModCtrl, VK_HOME); // beginning of document
+    else if (percent >= 99)
+        SendKeyCombo(ModCtrl, VK_END);  // end of document
+}
+
+// Opens Sumatra's own native print dialog (full printer/page-range/copies
+// control) in an already-embedded instance, used by ListPrint when reusing
+// a live pane for the exact file being printed -- see ListPrintW.
+static void ForwardPrintDialogToSumatra(ListerInstance* inst)
+{
+    if (!inst->sumatraWnd || !IsWindow(inst->sumatraWnd))
+        return;
+    SetFocus(inst->sumatraWnd);
+    SendKeyCombo(ModCtrl, 'P');
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,7 +1398,7 @@ static HWND DoListLoad(HWND ParentWin, const std::wstring& fileName)
     inst->hostWnd       = host;
     inst->parentWin     = ParentWin;
     inst->filePath      = fileName;
-    inst->currentInvert = g_config.autoNightMode ? false : g_config.nightMode; // AutoNightMode decides later via LCS_BACKGND
+    inst->currentInvert = g_config.autoNightMode ? false : g_config.nightMode; // AutoNightMode decides later via LC_NEWPARAMS
 
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -1313,6 +1416,10 @@ static HWND DoListLoad(HWND ParentWin, const std::wstring& fileName)
 }
 
 // --- ListLoadW (Unicode, preferred by TC) ---------------------------------
+// ShowFlags (e.g. lcs_alt_open, set when the file was opened via Alt+F3 /
+// Ctrl+PgDn rather than F3) is accepted per the real signature but
+// intentionally unused: this plugin embeds Sumatra the same way regardless
+// of how the file was opened, so there's nothing to branch on.
 __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, WCHAR* FileToLoad, int /*ShowFlags*/)
 {
     return DoListLoad(ParentWin, FileToLoad ? FileToLoad : L"");
@@ -1399,13 +1506,14 @@ __declspec(dllexport) void __stdcall ListCloseWindow(HWND ListWin)
 }
 
 // Tears down the currently-running embedded Sumatra process (if any) and
-// starts a fresh one for inst->filePath / inst->currentInvert. Used by both
-// page-jump (LCS_SETPAGE) and auto night-mode (LCS_BACKGND) handling, which
-// both require a relaunch since there's no live way to change either on an
-// already-running embedded instance. Caller must hold inst->opLock. Returns
-// false (after switching the pane to the same error/fallback UI every other
-// launch path uses) if the relaunch didn't succeed -- e.g. Sumatra was
-// closed/crashed externally between the original embed and this relaunch.
+// starts a fresh one for inst->filePath / inst->currentInvert. Currently
+// used only by AutoNightMode's LC_NEWPARAMS handling in ListSendCommand,
+// since there's no live way to toggle -invertcolors on an already-running
+// embedded instance without restarting it. Caller must hold inst->opLock.
+// Returns false (after switching the pane to the same error/fallback UI
+// every other launch path uses) if the relaunch didn't succeed -- e.g.
+// Sumatra was closed/crashed externally between the original embed and
+// this relaunch.
 static bool RelaunchSumatra(ListerInstance* inst)
 {
     CloseRunningSumatraProcess(inst);
@@ -1428,6 +1536,14 @@ static bool RelaunchSumatra(ListerInstance* inst)
 }
 
 // --- ListSendCommand --------------------------------------------------------
+// Real command set verified against the official WLX SDK (see the
+// constants block near the top of this file). TC calls this "when the
+// user changes some options in Lister's menu" -- resizing, page
+// navigation, zoom, and find/print all reach this plugin through other,
+// more direct paths (WM_SIZE on hostWnd; normal keyboard focus once
+// Sumatra's window has it; ListSearchDialog/ListSearchTextW; ListPrint) and
+// were never real ListSendCommand traffic despite an earlier, unverified
+// implementation assuming otherwise.
 __declspec(dllexport) int __stdcall ListSendCommand(HWND ListWin, int Command, int Parameter)
 {
     ListerInstancePtr instPtr = FindInstance(ListWin);
@@ -1441,79 +1557,49 @@ __declspec(dllexport) int __stdcall ListSendCommand(HWND ListWin, int Command, i
     ListerInstance* inst = instPtr.get();
 
     switch (Command) {
-        case LCS_RESIZE: {
-            if (inst->hostWnd && IsWindow(inst->hostWnd)) {
-                RECT rc; GetClientRect(inst->parentWin, &rc);
-                MoveWindow(inst->hostWnd, 0, 0, rc.right - rc.left, rc.bottom - rc.top, TRUE);
-                if (inst->sumatraWnd && IsWindow(inst->sumatraWnd))
-                    MoveWindow(inst->sumatraWnd, 0, 0, rc.right - rc.left, rc.bottom - rc.top, TRUE);
-            }
-            return LISTPLUGIN_OK;
-        }
-        case LCS_REDRAW:
-            if (inst->hostWnd) InvalidateRect(inst->hostWnd, nullptr, TRUE);
+        case LC_COPY:
+            ForwardCopyToSumatra(inst);
             return LISTPLUGIN_OK;
 
-        case LCS_NEXT: ForwardPageNav(inst, true);  return LISTPLUGIN_OK;
-        case LCS_PREV: ForwardPageNav(inst, false); return LISTPLUGIN_OK;
-
-        case LCS_FIND: ForwardFindToSumatra(inst, nullptr); return LISTPLUGIN_OK;
-        case LCS_COPY: ForwardCopyToSumatra(inst);           return LISTPLUGIN_OK;
-
-        // Reuse SETZOOMFACTOR's sign of Parameter as a simple in/out toggle
-        // (TC's own zoom factor units don't map 1:1 onto Sumatra's, so this
-        // is intentionally a coarse zoom-in/zoom-out rather than absolute).
-        case LCS_SETZOOMFACTOR:
-            ForwardZoom(inst, Parameter >= 0);
+        case LC_SELECTALL:
+            ForwardSelectAllToSumatra(inst);
             return LISTPLUGIN_OK;
 
-        case LCS_SETPAGE: {
-            // Best effort: re-launch with -page N, since Sumatra has no
-            // public message-based "go to page" API for an already-running
-            // embedded instance.
-            if (Parameter > 0) {
-                std::wstring base = inst->filePath;
-                ExtractPageSuffix(base); // strip any existing suffix
-                inst->filePath = base + L"#page=" + std::to_wstring(Parameter);
-                if (!RelaunchSumatra(inst))
-                    return LISTPLUGIN_ERROR;
-            }
+        case LC_SETPERCENT:
+            ForwardSetPercentToSumatra(inst, Parameter);
             return LISTPLUGIN_OK;
-        }
 
-        // TC sends the Lister pane's current background colour here,
-        // including on theme switches. When AutoNightMode=1, use it to
-        // follow Total Commander's own light/dark setting instead of a
-        // fixed NightMode= value.
-        case LCS_BACKGND: {
+        case LC_NEWPARAMS: {
+            // Parameter is a combination of LCP_* flags. This plugin only
+            // acts on the dark-mode ones (for AutoNightMode); the rest
+            // (wrap/fit/ansi-ascii/center/...) describe TC's own built-in
+            // text/hex/image viewer options and don't apply to an embedded
+            // PDF/ebook view -- "you may ignore these parameters if they
+            // don't apply to your document type" per the SDK docs.
             if (!g_config.autoNightMode)
                 return LISTPLUGIN_OK;
 
-            COLORREF c = (COLORREF)Parameter;
-            double luminance = 0.299 * GetRValue(c) + 0.587 * GetGValue(c) + 0.114 * GetBValue(c);
-            bool wantInvert = luminance < 128.0;
-
+            bool wantInvert = (Parameter & (LCP_DARKMODE | LCP_DARKMODENATIVE)) != 0;
             if (wantInvert != inst->currentInvert) {
                 inst->currentInvert = wantInvert;
-                LogF(L"AutoNightMode: background luminance=%.0f -> invert=%d, relaunching",
-                     luminance, wantInvert);
-                // Unlike LCS_SETPAGE, this fires from TC's own background/
-                // theme notifications rather than a direct user action, so
-                // a failed relaunch here is surfaced via the pane's error UI
-                // (RelaunchSumatra always applies that) rather than through
-                // this command's return code.
+                LogF(L"AutoNightMode: LC_NEWPARAMS dark-mode flag %s -> invert=%d, relaunching",
+                     wantInvert ? L"set" : L"unset", wantInvert);
+                // This fires from TC's own theme-change notifications rather
+                // than a direct user action, so a failed relaunch is
+                // surfaced via the pane's error UI (RelaunchSumatra always
+                // applies that) rather than through this command's return code.
                 RelaunchSumatra(inst);
             }
             return LISTPLUGIN_OK;
         }
 
         default:
-            return LISTPLUGIN_OK; // unhandled commands are simply ignored
+            return LISTPLUGIN_OK; // unhandled/unrecognized commands are simply ignored
     }
 }
 
 // --- ListSearchText / ListSearchTextW: Lister's own "find" dialog ---------
-__declspec(dllexport) int __stdcall ListSearchTextW(HWND ListWin, WCHAR* SearchString, int /*SearchParameter*/)
+__declspec(dllexport) int __stdcall ListSearchTextW(HWND ListWin, WCHAR* SearchString, int SearchParameter)
 {
     if (!SearchString)
         return LISTPLUGIN_ERROR;
@@ -1527,7 +1613,7 @@ __declspec(dllexport) int __stdcall ListSearchTextW(HWND ListWin, WCHAR* SearchS
         return LISTPLUGIN_ERROR;
 
     std::wstring text = SearchString;
-    ForwardFindToSumatra(inst.get(), &text);
+    ForwardFindToSumatra(inst.get(), text, SearchParameter);
     return LISTPLUGIN_OK;
 }
 
@@ -1538,6 +1624,36 @@ __declspec(dllexport) int __stdcall ListSearchText(HWND ListWin, char* SearchStr
     // forwards through to ListSearchTextW's own null check either way.
     std::wstring wtext = AnsiToWide(SearchString);
     return ListSearchTextW(ListWin, &wtext[0], SearchParameter);
+}
+
+// --- ListSearchDialog: plugin-native find UI, preferred over ListSearchTextW ---
+// Real, optional WLX export (SDK-verified): called instead of TC showing its
+// own generic search dialog. Forwarding straight to Sumatra's own find bar
+// gives the user its full find UI (result highlighting, its own match-case/
+// whole-word controls) rather than the clipboard-paste bridge ListSearchTextW
+// has to use for TC's generic dialog. Both are implemented and coexist
+// fine per the SDK docs; TC prefers this one when both are exported.
+__declspec(dllexport) int __stdcall ListSearchDialog(HWND ListWin, int FindNext)
+{
+    ListerInstancePtr inst = FindInstance(ListWin);
+    if (!inst)
+        return LISTPLUGIN_ERROR; // no live pane for this window; let TC fall back to its own dialog
+
+    std::lock_guard<std::mutex> opLock(inst->opLock);
+    if (inst->closed || !inst->sumatraWnd || !IsWindow(inst->sumatraWnd))
+        return LISTPLUGIN_ERROR;
+
+    SetFocus(inst->sumatraWnd);
+    if (FindNext)
+        SendKeyCombo(ModNone, VK_F3);  // continue the previous search forward
+    else
+        SendKeyCombo(ModCtrl, 'F');    // open Sumatra's own find bar fresh
+
+    // Per the SDK docs: never return LISTPLUGIN_ERROR here just because we
+    // can't confirm whether a match was found -- ERROR specifically means
+    // "please show your own dialog instead," which isn't what happened;
+    // we successfully showed Sumatra's native one.
+    return LISTPLUGIN_OK;
 }
 
 // --- ListGetPreviewBitmapW / ListGetPreviewBitmap: file-list thumbnails ---
@@ -1558,39 +1674,70 @@ __declspec(dllexport) HBITMAP __stdcall ListGetPreviewBitmap(
     return ListGetPreviewBitmapW(&wpath[0], width, height, contentbuf, contentbuflen);
 }
 
-// --- ListPrintW / ListPrint: non-interactive printing via Sumatra's CLI ---
-// Note: `margins` (custom print margins TC may pass) is intentionally not
-// forwarded to Sumatra. Sumatra manages its own print margins via
-// -print-settings rather than accepting page-margin hints from the caller,
-// and TC's exact units/semantics for this RECT aren't something this plugin
-// has confirmed -- guessing at a translation risks silently WRONG margins
-// (clipped content) rather than the current, honest no-op. Set PrintSettings=
-// in the INI if you need specific margins.
+// --- ListPrintW / ListPrint --------------------------------------------
+// Note: `Margins` (custom print margins, in MM_LOMETRIC units -- i.e.
+// tenths of a millimeter, per the SDK docs) is intentionally not forwarded
+// to Sumatra. Sumatra manages its own print margins via -print-settings
+// rather than accepting page-margin hints from the caller, and translating
+// an arbitrary RECT into Sumatra's own margin syntax without live testing
+// across versions risks silently WRONG margins (clipped content) rather
+// than the current, honest no-op. Set PrintSettings= in the INI if you
+// need specific margins. Margins may legitimately be null; the SDK docs
+// say it "may be ignored," which this plugin does either way.
 __declspec(dllexport) int __stdcall ListPrintW(
-    HWND /*ListWin*/, WCHAR* FileToPrint, WCHAR* DefPrinter, int /*PrintFlags*/, RECT /*margins*/)
+    HWND ListWin, WCHAR* FileToPrint, WCHAR* DefPrinter, int /*PrintFlags*/, RECT* /*Margins*/)
 {
     LoadConfig();
     if (!FileToPrint) return LISTPLUGIN_ERROR;
+
+    // Prefer Sumatra's own native print dialog (full printer/page-range/
+    // copies control) by reusing a live embedded instance for the exact
+    // file being printed, if one is open in this Lister window -- this
+    // matches the SDK's documented expectation that ListPrint "show a
+    // print dialog, in which the user can choose what to print, and
+    // select a different printer" far more faithfully than silent CLI
+    // printing does. Falls back to the CLI (-print-to/-print-to-default)
+    // approach when there's no live matching instance to reuse.
+    ListerInstancePtr inst = FindInstance(ListWin);
+    if (inst) {
+        std::lock_guard<std::mutex> opLock(inst->opLock);
+        if (!inst->closed && inst->sumatraWnd && IsWindow(inst->sumatraWnd)) {
+            std::wstring currentFile = inst->filePath;
+            ExtractPageSuffix(currentFile); // strip any "#page=N" so the comparison matches the real path
+            if (_wcsicmp(currentFile.c_str(), FileToPrint) == 0) {
+                ForwardPrintDialogToSumatra(inst.get());
+                return LISTPLUGIN_OK;
+            }
+        }
+    }
+
     std::wstring printer = DefPrinter ? DefPrinter : L"";
     return DoListPrint(FileToPrint, printer);
 }
 
 __declspec(dllexport) int __stdcall ListPrint(
-    HWND ListWin, char* FileToPrint, char* DefPrinter, int PrintFlags, RECT margins)
+    HWND ListWin, char* FileToPrint, char* DefPrinter, int PrintFlags, RECT* Margins)
 {
     if (!FileToPrint) return LISTPLUGIN_ERROR;
 
     std::wstring wFile    = AnsiToWide(FileToPrint);
     std::wstring wPrinter = AnsiToWide(DefPrinter);
     if (wFile.empty()) return LISTPLUGIN_ERROR;
-    return ListPrintW(ListWin, &wFile[0], wPrinter.empty() ? nullptr : &wPrinter[0], PrintFlags, margins);
+    return ListPrintW(ListWin, &wFile[0], wPrinter.empty() ? nullptr : &wPrinter[0], PrintFlags, Margins);
 }
 
 // --- Optional: TC calls this once at startup with persisted plugin params --
-__declspec(dllexport) void __stdcall ListSetDefaultParams(void* dps)
+__declspec(dllexport) void __stdcall ListSetDefaultParams(ListDefaultParamStruct* dps)
 {
-    (void)dps; // settings live in SumatraLister.ini instead of TC's plugin params
     LoadConfig();
+    // Settings live in SumatraLister.ini (next to the DLL) rather than the
+    // location dps->DefaultIniName suggests -- the SDK docs explicitly
+    // sanction storing plugin-specific settings "directly in that file, or
+    // in that directory under a different name," so this is a supported
+    // alternative, not a deviation. Logged only for diagnostics.
+    if (dps)
+        LogF(L"ListSetDefaultParams: interface version %lu/%lu, TC-suggested ini: %hs",
+             dps->PluginInterfaceVersionHi, dps->PluginInterfaceVersionLow, dps->DefaultIniName);
 }
 
 } // extern "C"

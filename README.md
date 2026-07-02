@@ -4,6 +4,67 @@ Displays PDF, CHM, DjVu, EPUB, FB2, MOBI, PRC, XPS/OXPS, and comic-archive
 (CB7, CBR, CBT, CBZ) files inside Total Commander's Lister (F3) by embedding
 SumatraPDF.exe directly into the Lister pane.
 
+## API correctness
+
+An earlier version of this plugin's `ListSendCommand` implementation, its
+`ListSearchText`/`ListSearchTextW` handling, its "Auto Night Mode" feature,
+and `ListPrint`'s exact signature were all based on **unverified** guesses
+at the Total Commander Lister Plugin (WLX) API rather than the real,
+documented one. This has since been corrected by fetching and reading the
+official SDK directly (https://github.com/ghisler/WLX-SDK,
+https://ghisler.github.io/WLX-SDK/). Concretely, what was wrong:
+
+- **`ListSendCommand` used entirely invented command constants** (things
+  named `LCS_RESIZE`, `LCS_NEXT`, `LCS_PREV`, `LCS_FIND`, `LCS_BACKGND`,
+  `LCS_SETPAGE`, etc.) that Total Commander never actually sends. The real,
+  complete command set is four values: `LC_COPY`, `LC_NEWPARAMS`,
+  `LC_SELECTALL`, `LC_SETPERCENT`. Several of the old (fake) commands were
+  "solving" things that either aren't real TC behavior at all, or already
+  work for free through this plugin's own architecture — resizing happens
+  via `WM_SIZE` sent directly to the host window, and page navigation/zoom
+  reach Sumatra directly through normal keyboard input once its window has
+  focus, with no explicit forwarding needed either way.
+- **"Auto Night Mode" could never have worked.** It read a command called
+  `LCS_BACKGND` carrying a background colour, which does not exist in the
+  real API — Total Commander would never have sent it, so the feature was
+  silently inert regardless of the `AutoNightMode=` setting. The real
+  mechanism is completely different: dark-mode state arrives via
+  `LC_NEWPARAMS` with the `LCP_DARKMODE`/`LCP_DARKMODENATIVE` flags. This is
+  now implemented correctly.
+- **`ListPrint`/`ListPrintW`'s `Margins` parameter was declared as `RECT`
+  passed by value; the real signature is `RECT*` (a pointer).** Under the
+  `__stdcall` convention TC uses, passing a 16-byte struct where the caller
+  pushes an 8-byte pointer is a genuine stack-argument-size mismatch — a
+  real crash/corruption risk on an actual call, not just a style issue.
+  Fixed to the correct pointer signature.
+- **`ListSearchText`/`ListSearchTextW` ignored `SearchParameter` entirely**,
+  discarding the real `LCS_FINDFIRST`/`LCS_MATCHCASE`/`LCS_WHOLEWORDS`/
+  `LCS_BACKWARDS` flags TC passes (these flags *are* real — the confusion
+  was assuming they belonged to `ListSendCommand` instead). Now decoded and
+  used, at minimum for search direction (F3 vs Shift+F3).
+- Two `ListLoad` `ShowFlags` constants (`lcs_show_buttons`,
+  `lcs_show_browser`) were also invented and, on inspection, were never
+  actually used anywhere in the plugin's logic — removed.
+
+Also added while correcting this: `ListSearchDialog`, a real, optional WLX
+export that lets a plugin show its own find UI instead of routing through
+TC's generic search dialog — a better fit here than the clipboard-paste
+bridge `ListSearchTextW` has to use, since it forwards straight to
+Sumatra's own find bar. And a real, verified `ITM_FOCUS` notification
+mechanism so Total Commander's Quick View Panel (Ctrl+Q) correctly
+highlights this pane when it gains focus.
+
+**Deliberately not implemented:** `ListNotificationReceived`. This is a
+real, optional WLX export, but the SDK's own documentation says plainly not
+to implement it unless a plugin uses owner-drawn child controls or needs
+`WM_MEASUREITEM`/`WM_DRAWITEM`/`WM_NOTIFY` routing — this plugin does
+neither (it just hosts Sumatra's own reparented window), so implementing it
+would be dead weight against the SDK's own guidance, not a gap.
+
+Every constant and signature referenced above and used in `SumatraLister.cpp`
+was checked against the official SDK pages directly; see the comments at
+each site in the source for specifics.
+
 ## Features
 
 - **Auto-detection** of SumatraPDF via registry App Paths, install/uninstall
@@ -20,13 +81,17 @@ SumatraPDF.exe directly into the Lister pane.
   copy it next to the `.wlx`/`.wlx64` file and edit as needed.
 - **Deep-link page jumping**: append `#page=N` to the file path passed into
   `ListLoad`/`ListLoadNext` (e.g. `C:\book.pdf#page=42`) to open directly at
-  page 42. Lister's own page-navigation toolbar (`LCS_SETPAGE`) uses the same
-  mechanism internally.
-- **Find / Copy / zoom forwarding**: Lister's Find dialog (`ListSearchTextW`),
-  and the toolbar's Find/Copy/Zoom buttons (`ListSendCommand`), are forwarded
-  into Sumatra's own find bar, clipboard copy, and Ctrl+/Ctrl- zoom — this is
-  done with synthesized keystrokes (`SendInput`) targeted at the embedded
-  window, since Sumatra has no message-based remote-control API.
+  page 42. A real file that happens to be named that way on disk always
+  takes precedence over the heuristic.
+- **Find / Copy / Select All / scroll-to-percent**: the real
+  `ListSendCommand` set (`LC_COPY`, `LC_SELECTALL`, `LC_SETPERCENT`) and
+  `ListSearchText[W]`/`ListSearchDialog` (honoring the real
+  `LCS_FINDFIRST`/`LCS_BACKWARDS` flags for search direction) are forwarded
+  into Sumatra's own find bar, clipboard copy, and select-all — done with
+  synthesized keystrokes (`SendInput`) targeted at the embedded window,
+  since Sumatra has no message-based remote-control API. Page navigation
+  and zoom need no forwarding at all: they reach Sumatra directly through
+  normal keyboard input once its window has focus.
 - **Process reuse** across `ListLoadNext` (Lister's next/previous file
   navigation reuses the same host window instead of recreating it).
 - **File-list thumbnails**: implements `ListGetPreviewBitmap[W]` using the
@@ -34,14 +99,20 @@ SumatraPDF.exe directly into the Lister pane.
   Commander's Thumbnails view shows real first-page previews for these file
   types — no extra Sumatra process spawned per thumbnail. Toggle with
   `ThumbnailsEnabled=` in the INI.
-- **Printing**: implements `ListPrint[W]`, so Total Commander's File > Print
-  on a selected file launches Sumatra's own non-interactive command-line
-  printing (`-print-to[-default]`), optionally with `-print-settings` from
-  the INI (`PrintSettings=`, e.g. `fit`, `duplex`, `landscape`).
+- **Printing**: implements `ListPrint[W]`. When the file being printed is
+  already open in a live embedded pane, shows Sumatra's own native print
+  dialog (full printer/page-range/copies control) via Ctrl+P; otherwise
+  falls back to Sumatra's non-interactive command-line printing
+  (`-print-to[-default]`), optionally with `-print-settings` from the INI
+  (`PrintSettings=`, e.g. `fit`, `duplex`, `landscape`).
 - **Auto night mode**: with `AutoNightMode=1`, the plugin reads Total
-  Commander's own Lister background colour (`LCS_BACKGND`) and relaunches
-  Sumatra with/without `-invertcolors` to match TC's light/dark theme,
-  instead of relying on a fixed `NightMode=` value.
+  Commander's real dark-mode notification (`LC_NEWPARAMS` with the
+  `LCP_DARKMODE`/`LCP_DARKMODENATIVE` flags) and relaunches Sumatra
+  with/without `-invertcolors` to match TC's theme, instead of relying on a
+  fixed `NightMode=` value.
+- **Quick View Panel integration**: notifies Total Commander
+  (`WM_COMMAND`/`ITM_FOCUS`) when the embedded pane gains focus, so the
+  Quick View Panel (Ctrl+Q) highlights its header correctly.
 - **Pop-out to full Sumatra** (`EnablePopOut=1`, off by default): registers
   Ctrl+Alt+O to reopen the current file in a normal, full SumatraPDF window
   with its menu/toolbar, for anything the embedded view doesn't expose
@@ -78,6 +149,11 @@ actually break something), and none were left unexamined.
 
 **Bugs found and fixed by this process** (beyond what's described inline at
 each fix site in the source):
+- The `ListSendCommand`/`ListSearchText`/`ListPrint`/"Auto Night Mode"
+  correctness issues described in "API correctness" above — found by
+  fetching and reading the official WLX SDK directly rather than relying on
+  memory, after which several previously-"working" features turned out to
+  have never been reachable through real Total Commander behavior at all.
 - `ForwardFindToSumatra` (Lister's Find dialog) was silently overwriting the
   system clipboard with the search text and never restoring what was there
   before — every search clobbered whatever the user had last copied. Now
@@ -213,16 +289,29 @@ PDF, CHM, DJVU, EPUB, FB2, FB2Z, MOBI, PRC, XPS, OXPS, CB7, CBR, CBT, CBZ
 ## Notes / limitations
 
 - This wraps Sumatra's window rather than re-implementing a renderer.
-  Find/copy/zoom/page-navigation forwarding uses synthesized keystrokes
-  (`SendInput`) aimed at the embedded window, which requires the Lister
-  window to be the foreground window — this matches normal usage but won't
-  work if something else has stolen focus at the exact moment a toolbar
-  button is pressed.
-- `LCS_SETPAGE` (jump to page) and the `#page=N` deep link both work by
-  relaunching the embedded Sumatra process with `-page N`, since there's no
-  way to tell an already-running embedded instance to jump pages without
-  restarting it. This is fast but does cause a brief reload. A real file
-  that happens to be named literally like a deep link (e.g.
+  Find/copy/select-all forwarding uses synthesized keystrokes (`SendInput`)
+  aimed at the embedded window, which requires the Lister window to be the
+  foreground window — this matches normal usage but won't work if something
+  else has stolen focus at the exact moment a search is triggered. Page
+  navigation and zoom don't need this at all: they reach Sumatra directly
+  through normal keyboard input once its window has focus.
+- `LCS_MATCHCASE`/`LCS_WHOLEWORDS` (case-sensitive / whole-word search
+  flags from `ListSearchText`) are not translated into Sumatra's find bar.
+  This plugin doesn't have confirmed knowledge of Sumatra's exact find-bar
+  hotkeys for toggling those specific options, and guessing risked silently
+  toggling the wrong control instead of the intended one. `LCS_BACKWARDS`
+  (search direction) is honored via F3/Shift+F3.
+- `LC_SETPERCENT` (Total Commander's "scroll to X% of document") and the
+  `#page=N` deep link are handled differently. The deep link opens exactly
+  at the requested page by relaunching the embedded Sumatra process with
+  `-page N` (there's no way to tell an already-running embedded instance to
+  jump pages without restarting it — fast, but does cause a brief reload).
+  `LC_SETPERCENT` only has real page-count information TC's side, which
+  Sumatra has no message-based API to query from this plugin's side — so
+  only the two unambiguous boundaries (0%→first page, 100%→last page) are
+  handled precisely, via Sumatra's own Ctrl+Home/Ctrl+End; intermediate
+  percentages are a documented no-op rather than a guess at the wrong page.
+  A real file that happens to be named literally like a deep link (e.g.
   `Report#page=2.pdf`) is always opened as-is — the filesystem is checked
   before the `#page=` heuristic is applied.
 - `EnablePopOut`'s Ctrl+Alt+O hotkey is registered via Win32's
@@ -239,7 +328,10 @@ PDF, CHM, DJVU, EPUB, FB2, FB2Z, MOBI, PRC, XPS, OXPS, CB7, CBR, CBT, CBZ
   and `ExtraArgs` all map to real SumatraPDF command-line switches
   (`-restrict`, `-invertcolors`, `-zoom`, `-view`, `-print-settings`); verify
   exact accepted values for your installed version with `SumatraPDF.exe -h`,
-  since these have evolved slightly across releases.
+  since these have evolved slightly across releases. (These are genuine
+  SumatraPDF CLI switches, independent of the WLX API corrections described
+  above — SumatraPDF's own command-line reference was not the source of the
+  earlier errors.)
 - Tested conceptually against Sumatra's documented `-plugin` switch; verify
   against your installed Sumatra build's command-line help if you use a very
   old version.
@@ -253,11 +345,14 @@ PDF, CHM, DJVU, EPUB, FB2, FB2Z, MOBI, PRC, XPS, OXPS, CB7, CBR, CBT, CBZ
   printer could exceed it, in which case the plugin now reports failure and
   terminates the still-running Sumatra process rather than leaving it
   orphaned. This wait happens on whichever thread Total Commander calls
-  `ListPrint` on.
+  `ListPrint` on. This CLI-print path is only used as a fallback now — when
+  the file being printed is already open in a live embedded pane, Ctrl+P
+  opens Sumatra's own print dialog instead (see Features).
 - `ListPrint` does not forward custom print margins from Total Commander
-  (the `margins` parameter). Sumatra manages its own print margins via
+  (the `Margins` parameter, a `RECT*` in units of MM_LOMETRIC — tenths of a
+  millimeter — per the SDK docs). Sumatra manages its own print margins via
   `-print-settings` rather than accepting page-margin hints from the caller,
-  and this plugin doesn't have confirmed knowledge of TC's exact units for
-  that parameter — guessing at a translation risked silently wrong (clipped)
-  output, which seemed worse than the current explicit no-op. Use
-  `PrintSettings=` in the INI if you need specific margins.
+  and translating an arbitrary rectangle into Sumatra's own margin syntax
+  without live cross-version testing risked silently wrong (clipped) output
+  — worse than the current, explicit no-op. Use `PrintSettings=` in the INI
+  if you need specific margins.

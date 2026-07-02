@@ -15,6 +15,7 @@ EXPORTS
     ListSendCommand
     ListSearchText
     ListSearchTextW
+    ListSearchDialog
     ListGetPreviewBitmap
     ListGetPreviewBitmapW
     ListPrint
