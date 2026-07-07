@@ -1,3 +1,5 @@
+# By adding in this file with the build in archive will promp to auto install the archive if double clicked from within total commander. 
+
 [plugininstall]
 description=SumatraLister for Total Commander
 descriptionrus=SumatraLister to view PDF, CHM, DjVu, EPUB, FB2, MOBI, PRC, OpenXPS, OXPS, XPS, CB7, CBR, CBT, CBZ files; Needs SumatraPDF to be installed or portable version of SumatraPDF.
