@@ -1,9 +1,10 @@
 // ============================================================================
 //  SumatraLister.wlx / SumatraLister.wlx64
 //
-//  Total Commander "Lister" (WLX) plugin that displays PDF, CHM, DjVu, EPUB,
-//  FB2, MOBI, PRC, XPS/OXPS and comic archive (CB7/CBR/CBT/CBZ) files by
-//  embedding SumatraPDF.exe directly into the Lister window.
+//  Total Commander "Lister" (WLX) plugin that displays PDF, EPUB, MOBI/Kindle,
+//  FB2, DjVu, CHM, XPS/OXPS, OFD and comic archive (CB7/CBR/CBT/CBZ) files --
+//  plus any other type opted into with ExtraExtensions= -- by embedding
+//  SumatraPDF.exe directly into the Lister window.
 //
 //  How it works
 //  ------------
@@ -26,8 +27,10 @@
 //     optional manual override via SumatraLister.ini.
 //   - INI-configurable launch options: default zoom, default view mode,
 //     page-surround background colour, night/inverted-colour mode,
-//     restricted (sandboxed) mode, embed timeout, an EnabledExtensions
-//     allowlist, per-[EXT]-section overrides (e.g. different defaults for
+//     restricted (sandboxed) mode, embed timeout, EnabledExtensions (trim)
+//     and ExtraExtensions (add) lists of the file types claimed (so newer
+//     SumatraPDF formats -- Markdown, OFD, CAJ, RTF... -- need no code
+//     change), per-[EXT]-section overrides (e.g. different defaults for
 //     comics vs. PDFs), a SyncTeX inverse-search command, and free-form
 //     extra command-line arguments.
 //   - Deep links: append parameters after a "#" in the path passed to
@@ -242,15 +245,28 @@ struct ListDefaultParamStruct {
 // place in context.
 #define PLUGIN_VERSION L"1.1"
 
-// Canonical list of extensions this plugin knows how to handle (matches
-// what SumatraPDF itself can open). Used to build ListGetDetectString's
-// detection string (filtered by EnabledExtensions if set) and to look for
-// per-extension INI override sections ([PDF], [CBZ], etc.) in
-// LoadConfigImpl -- kept as one shared list so those two things can't
-// silently drift out of sync with each other.
+// The extensions this plugin claims by default: document and e-book formats
+// SumatraPDF opens (per its own "Supported document formats" page) and that
+// Total Commander has no built-in viewer for, so claiming them can't take
+// anything away from a viewer the user already relies on. Deliberately NOT
+// here, though Sumatra can open them: types Total Commander already views
+// well itself or that other tools commonly own -- plain text (.txt/.log/
+// .nfo), Markdown (.md), RTF, SVG, images, archives, and .pdb (which is also
+// the debug-symbol format every Windows developer has plenty of); CAJ (its
+// first use prompts to download a converter); and types needing extra
+// software (DVI, PostScript). Any of those can be added with ExtraExtensions=
+// in the INI, so this list never needs to chase Sumatra's own. Used to build
+// ListGetDetectString's detection string (filtered by EnabledExtensions if
+// set) and, together with ExtraExtensions, to look for per-extension INI
+// override sections ([PDF], [CBZ], etc.) in LoadConfigImpl -- one shared
+// list so those two things can't silently drift apart.
 static const wchar_t* const kSupportedExtensions[] = {
-    L"PDF", L"CHM", L"DJVU", L"EPUB", L"FB2", L"FB2Z", L"MOBI", L"PRC",
-    L"XPS", L"OXPS", L"CB7", L"CBR", L"CBT", L"CBZ"
+    L"PDF", L"AI",                                // PDF, and PDF-compatible Illustrator files
+    L"EPUB", L"MOBI", L"PRC", L"AZW", L"AZW3",    // e-books (EPUB, Mobipocket/Kindle family)
+    L"FB2", L"FB2Z", L"FBZ", L"ZFB2",             // FictionBook
+    L"DJVU", L"DJV", L"CHM",
+    L"XPS", L"OXPS", L"OFD",                      // fixed-layout (OFD needs Sumatra 3.7+)
+    L"CB7", L"CBR", L"CBT", L"CBZ"                // comic archives
 };
 
 // ---------------------------------------------------------------------------
@@ -275,15 +291,22 @@ static const wchar_t* const kSupportedExtensions[] = {
 //                                                     ;     explanation in SumatraLister.ini.
 //  InverseSearchCommand=                             ; SyncTeX/PdfSync inverse-search command line,
 //                                                     ;     forwarded to -inverse-search, e.g.
-//                                                     ;     "code.exe -g \"%f\":%l" -- lets Ctrl+clicking
+//                                                     ;     "code.exe -g \"%f\":%l" -- lets double-clicking
 //                                                     ;     a location in the embedded PDF jump back to
-//                                                     ;     the LaTeX source in your editor. CAUTION: same
+//                                                     ;     the LaTeX source in your editor (needs SyncTeX
+//                                                     ;     data next to the PDF). CAUTION: same
 //                                                     ;     persistent-settings-file caveat as
 //                                                     ;     BackgroundColor= above applies here too.
 //  EnabledExtensions=                                ; comma-separated allowlist, e.g. "PDF,EPUB,CBZ";
 //                                                     ;     empty (default) = every supported extension
 //                                                     ;     stays enabled. Trims what ListGetDetectString
 //                                                     ;     advertises to TC without recompiling.
+//  ExtraExtensions=                                  ; comma-separated extra file types to claim beyond the
+//                                                     ;     built-in list, e.g. "MD,CAJ,RTF" -- formats newer
+//                                                     ;     SumatraPDF versions can open (see SumatraLister.ini
+//                                                     ;     for the known ones and the cautions). Each entry
+//                                                     ;     must be 1-10 letters/digits; others are ignored
+//                                                     ;     and logged.
 //  PrintSettings=                                    ; forwarded to -print-settings for ListPrint
 //  InteractivePrintFallback=1                        ; see README/ini for the full explanation
 //  ThumbnailsEnabled=1                               ; 1 = supply file-list thumbnails via Shell API
@@ -331,6 +354,7 @@ struct PluginConfig {
     std::wstring backgroundColor;
     std::wstring inverseSearchCommand;
     std::wstring enabledExtensions;  // empty = all; else comma-separated allowlist
+    std::wstring extraExtensions;    // comma-separated extra extensions to claim, beyond kSupportedExtensions
     std::wstring printSettings;
     bool         interactivePrintFallback = true;
     bool         thumbnailsEnabled       = true;
@@ -474,6 +498,64 @@ static std::wstring ReadLogTail(int maxLines)
     return result.empty() ? L"(log is empty)" : result;
 }
 
+// Parses a comma-separated extension list ("md, .OFD,caj") into validated,
+// upper-cased, de-duplicated tokens in first-seen order. Each entry is
+// trimmed and may carry one leading '.'. An entry is accepted only if it is
+// 1-10 ASCII letters/digits: the result ends up inside Total Commander's
+// detect-string syntax (EXT="MD" | ...), where a quote, '|', '&' or other
+// punctuation would corrupt or change the meaning of the whole expression.
+// Anything else is returned via *rejected (when given) instead of being
+// guessed at. Empty entries (a trailing comma, say) are silently skipped.
+static std::vector<std::wstring> ParseExtensionList(const std::wstring& list,
+                                                    std::vector<std::wstring>* rejected = nullptr)
+{
+    std::vector<std::wstring> out;
+    size_t start = 0;
+    while (start <= list.size()) {
+        size_t comma = list.find(L',', start);
+        std::wstring tok = list.substr(start, comma == std::wstring::npos ? std::wstring::npos : comma - start);
+
+        size_t first = tok.find_first_not_of(L" \t");
+        if (first != std::wstring::npos) {
+            size_t last = tok.find_last_not_of(L" \t");
+            tok = tok.substr(first, last - first + 1);
+            if (tok.size() > 1 && tok[0] == L'.')
+                tok.erase(0, 1);
+
+            bool ok = !tok.empty() && tok.size() <= 10;
+            for (wchar_t c : tok) {
+                if (!((c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z')))
+                    ok = false;
+            }
+            if (ok) {
+                for (wchar_t& c : tok)
+                    c = (wchar_t)towupper(c);
+                if (std::find(out.begin(), out.end(), tok) == out.end())
+                    out.push_back(tok);
+            } else if (rejected) {
+                rejected->push_back(tok);
+            }
+        }
+
+        if (comma == std::wstring::npos) break;
+        start = comma + 1;
+    }
+    return out;
+}
+
+// Every extension this plugin can handle, before the EnabledExtensions
+// allowlist is applied: the built-in list, then any ExtraExtensions entries
+// not already in it.
+static std::vector<std::wstring> BuildAllKnownExtensions(const std::vector<std::wstring>& extras)
+{
+    std::vector<std::wstring> all(std::begin(kSupportedExtensions), std::end(kSupportedExtensions));
+    for (const std::wstring& e : extras) {
+        if (std::find(all.begin(), all.end(), e) == all.end())
+            all.push_back(e);
+    }
+    return all;
+}
+
 static void LoadConfigImpl()
 {
     std::wstring ini = GetIniPath();
@@ -522,6 +604,9 @@ static void LoadConfigImpl()
     GetPrivateProfileStringW(L"Settings", L"EnabledExtensions", L"", buf, _countof(buf), ini.c_str());
     g_config.enabledExtensions = buf;
 
+    GetPrivateProfileStringW(L"Settings", L"ExtraExtensions", L"", buf, _countof(buf), ini.c_str());
+    g_config.extraExtensions = buf;
+
     GetPrivateProfileStringW(L"Settings", L"PrintSettings", L"", buf, _countof(buf), ini.c_str());
     g_config.printSettings = buf;
 
@@ -534,8 +619,15 @@ static void LoadConfigImpl()
     // Per-extension [EXT] override sections. A nonexistent section reads
     // back identically to an empty key, so there's no need to separately
     // check for the section's existence -- just try each expected key.
+    std::vector<std::wstring> rejectedExtras;
+    const std::vector<std::wstring> knownExts =
+        BuildAllKnownExtensions(ParseExtensionList(g_config.extraExtensions, &rejectedExtras));
+    for (const std::wstring& bad : rejectedExtras)
+        LogF(L"Ignoring invalid ExtraExtensions entry '%ls' (each must be 1-10 letters or digits, e.g. MD)", bad.c_str());
+
     g_config.perExtension.clear();
-    for (const wchar_t* ext : kSupportedExtensions) {
+    for (const std::wstring& extName : knownExts) {
+        const wchar_t* ext = extName.c_str();
         PerExtensionOverrides ov;
         bool any = false;
 
@@ -553,13 +645,13 @@ static void LoadConfigImpl()
     }
 
     LogF(L"Config loaded: override='%ls' extra='%ls' restrict=%d night=%d auto-night=%d "
-         L"zoom='%ls' view='%ls' bgcolor='%ls' inversesearch-set=%d enabled-ext='%ls' "
+         L"zoom='%ls' view='%ls' bgcolor='%ls' inversesearch-set=%d enabled-ext='%ls' extra-ext='%ls' "
          L"timeout=%lu fallback=%d per-ext-overrides=%lu",
          g_config.sumatraPathOverride.c_str(), g_config.extraArgs.c_str(),
          g_config.restrictMode, g_config.nightMode, g_config.autoNightMode,
          g_config.defaultZoom.c_str(), g_config.defaultView.c_str(),
          g_config.backgroundColor.c_str(), !g_config.inverseSearchCommand.empty(),
-         g_config.enabledExtensions.c_str(),
+         g_config.enabledExtensions.c_str(), g_config.extraExtensions.c_str(),
          g_config.embedTimeoutMs, g_config.fallbackShellOpen, (unsigned long)g_config.perExtension.size());
 }
 
@@ -1011,6 +1103,32 @@ static std::wstring FormatSumatraVersion()
         return L"unknown";
     return std::to_wstring(v.major) + L"." + std::to_wstring(v.minor) + L"." +
            std::to_wstring(v.build) + L"." + std::to_wstring(v.revision);
+}
+
+// File types that need a newer SumatraPDF than the baseline, with the minimum
+// version taken from Sumatra's own "Supported document formats" page. Only
+// entries confirmed there are listed (the same policy as the -search check:
+// a wrong guess would falsely tell people their Sumatra is too old). Used
+// only for an advisory log line when such a file is opened.
+struct ExtMinVersion { const wchar_t* ext; WORD major; WORD minor; };
+static const ExtMinVersion kExtMinVersions[] = {
+    { L"OFD", 3, 7 },
+    { L"RTF", 3, 7 },
+    { L"LIT", 3, 7 },
+};
+
+// If `extUpper` is a file type with a confirmed minimum SumatraPDF version,
+// stores it in *major / *minor and returns true.
+static bool GetExtensionMinVersion(const std::wstring& extUpper, WORD* major, WORD* minor)
+{
+    for (const ExtMinVersion& e : kExtMinVersions) {
+        if (extUpper == e.ext) {
+            *major = e.major;
+            *minor = e.minor;
+            return true;
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1763,6 +1881,12 @@ static bool LaunchSumatraEmbedded(ListerInstance* inst)
         LogF(L"Deep link for %ls uses search=, which needs SumatraPDF 3.4 or newer; the installed "
              L"version is %ls, so this may be ignored", filePath.c_str(), FormatSumatraVersion().c_str());
     }
+    WORD minMajor = 0, minMinor = 0;
+    const std::wstring openExt = GetExtensionUpper(filePath);
+    if (GetExtensionMinVersion(openExt, &minMajor, &minMinor) && !SumatraVersionAtLeast(minMajor, minMinor)) {
+        LogF(L"%ls files need SumatraPDF %u.%u or newer; the installed version is %ls, so %ls may not open",
+             openExt.c_str(), (unsigned)minMajor, (unsigned)minMinor, FormatSumatraVersion().c_str(), filePath.c_str());
+    }
 
     std::wstring cmdLine = L"\"" + exe + L"\"";
     AppendArg(cmdLine, L"-plugin");
@@ -2208,6 +2332,7 @@ static std::wstring BuildDiagnosticSnapshot(const ListerInstance* inst)
     s += L"  BackgroundColor: " + (g_config.backgroundColor.empty() ? std::wstring(L"(none)") : g_config.backgroundColor) + L"\r\n";
     s += L"  InverseSearchCommand: "; s += (g_config.inverseSearchCommand.empty() ? L"(not set)" : L"(set)"); s += L"\r\n";
     s += L"  EnabledExtensions: " + (g_config.enabledExtensions.empty() ? std::wstring(L"(all)") : g_config.enabledExtensions) + L"\r\n";
+    s += L"  ExtraExtensions: " + (g_config.extraExtensions.empty() ? std::wstring(L"(none)") : g_config.extraExtensions) + L"\r\n";
     s += L"  ThumbnailsEnabled: "; s += (g_config.thumbnailsEnabled ? L"1" : L"0"); s += L"\r\n";
     s += L"  EmbedTimeoutMs: " + std::to_wstring(g_config.embedTimeoutMs) + L"\r\n";
     s += L"  FallbackToShellOpen: "; s += (g_config.fallbackShellOpen ? L"1" : L"0"); s += L"\r\n";
@@ -2473,20 +2598,21 @@ __declspec(dllexport) void __stdcall ListGetDetectString(char* DetectString, int
 {
     LoadConfig(); // EnabledExtensions must be loaded before building this
 
-    // Built once from kSupportedExtensions (all pure-ASCII, so the direct
-    // wchar_t->char narrowing below is safe) filtered by EnabledExtensions;
-    // computed on first call and reused after, since EnabledExtensions
-    // can't change during the plugin's lifetime (no live INI reload).
+    // Built once from the built-in list plus any ExtraExtensions, filtered by
+    // EnabledExtensions; computed on first call and reused after, since the
+    // INI can't change during the plugin's lifetime (no live reload). Every
+    // entry is pure ASCII letters/digits (the built-ins by construction, the
+    // extras by ParseExtensionList's validation), so the direct
+    // wchar_t->char narrowing below is safe -- and nothing in it can
+    // introduce detect-string syntax of its own.
     static const std::string detect = [] {
         std::string s;
-        bool first = true;
-        for (const wchar_t* ext : kSupportedExtensions) {
-            if (!IsExtensionEnabled(ext))
+        for (const std::wstring& ext : BuildAllKnownExtensions(ParseExtensionList(g_config.extraExtensions))) {
+            if (!IsExtensionEnabled(ext.c_str()))
                 continue;
-            if (!first) s += " | ";
-            first = false;
+            if (!s.empty()) s += " | ";
             s += "EXT=\"";
-            for (const wchar_t* p = ext; *p; p++) s += (char)*p;
+            for (wchar_t c : ext) s += (char)c;
             s += "\"";
         }
         return s;

@@ -1,14 +1,15 @@
 # SumatraLister — a Total Commander Lister plugin powered by SumatraPDF
 
 SumatraLister (`SumatraLister.wlx` for 32-bit, `SumatraLister.wlx64` for 64-bit
-Total Commander) previews **PDF, CHM, DjVu, EPUB, FB2, MOBI/PRC, XPS/OXPS and comic
-archives (CBZ/CBR/CB7/CBT)** inside the Lister (F3) pane by embedding SumatraPDF
+Total Commander) previews **PDF, EPUB, MOBI/Kindle, FB2, DjVu, CHM, XPS/OXPS, OFD and comic
+archives (CBZ/CBR/CB7/CBT)** — and, if you opt in, anything else your SumatraPDF can open
+(Markdown, CAJ, RTF, plain text, images…) — inside the Lister (F3) pane by embedding SumatraPDF
 itself, using SumatraPDF's own built-in `-plugin <HWND>` embedding mode. You get
 Sumatra's real renderer, search, selection and keyboard handling — not a re-implementation.
 
 Package contents: `SumatraLister.cpp` (the plugin, single file), `SumatraLister.def`,
 `SumatraLister.ini` (fully commented settings template), `CMakeLists.txt`, this
-`README.md`, and `tests/` (the end-to-end verification harness, see *Tests*).
+`README.md`, `INSTRUCTIONS.md` (step-by-step install/usage/troubleshooting guide), and `tests/` (the end-to-end verification harness, see *Tests*).
 
 ---
 
@@ -43,7 +44,7 @@ command-line reference) and, where possible, by actually running the code:
   listed in `PATH` (absolute entries only — never the current directory, see *Notes*).
 - **`SumatraLister.ini`** (optional, next to the plugin): extra args, `-restrict`
   mode, night mode, default zoom/view, background colour, an inverse-search command,
-  an extension allowlist, per-extension overrides (`[CBZ]`, `[PDF]`, …), print
+  an extension allowlist plus an `ExtraExtensions` list for formats beyond the defaults, per-extension overrides (`[CBZ]`, `[PDF]`, …), print
   behaviour, embed timeout, shell-open fallback, hotkeys, debug log. See the file.
 - **Deep links** — append parameters after `#` to the path handed to the plugin
   (combine with `&`; values are percent-decoded):
@@ -54,7 +55,7 @@ command-line reference) and, where possible, by actually running the code:
   deep link always wins over the heuristic.
   Example: `C:\book.pdf#page=5&search=hello%20world`
 - **The real WLX surface**: `ListLoad[W]`, `ListLoadNext[W]` (reuses the pane),
-  `ListCloseWindow`, `ListGetDetectString` (honours `EnabledExtensions`),
+  `ListCloseWindow`, `ListGetDetectString` (honours `EnabledExtensions` and `ExtraExtensions`),
   `ListSendCommand` (copy / select-all / scroll-to-0%/100% / dark-mode),
   `ListSearchText[W]` (with `LCS_BACKWARDS`), `ListSearchDialog`, `ListPrint[W]`,
   `ListGetPreviewBitmap[W]`, `ListSetDefaultParams`. (`ListNotificationReceived` is
@@ -97,15 +98,17 @@ What was actually done, and what was not.
 helpers), four standard Win32 `(HBRUSH)(COLOR_WINDOW+1)`/`(WNDPROC)` int-to-pointer
 idioms, `LogF`'s deliberate C-variadic, and the `_UNICODE` macro Windows requires.
 
-**Unit-level (179 assertions)** on code extracted *verbatim* from the shipped source
+**Unit-level (233 assertions)** on code extracted *verbatim* from the shipped source
 and run under Wine: the hotkey parser (15 valid forms, 20 rejected forms), URL
 decoding edge cases, the deep-link parser (including a real file with a literal `#`
 in its name), command-line quoting round-tripped through the real
 `CommandLineToArgvW` (embedded quotes, trailing backslashes, an injection attempt,
 editor commands with their own inner quotes), the forward-search argument shape,
-the `EnabledExtensions` parser, and the Sumatra version comparison.
+the `EnabledExtensions` and `ExtraExtensions` parsers (including attempts to smuggle
+detect-string syntax through an extension entry), the default-claim policy, and the Sumatra
+version comparison and per-file-type minimum-version table.
 
-**End-to-end (209 checks, 11 scenarios)** by loading the real built plugin DLL under
+**End-to-end (284 checks, 16 scenarios)** by loading the real built plugin DLL under
 Wine on a virtual display, against a fake `SumatraPDF.exe` that mimics `-plugin`
 embedding (it creates a cross-process child window of the given HWND and records its
 exact argv): embedding and window ownership, resize following, `ITM_FOCUS`
@@ -115,8 +118,10 @@ with no orphaned processes, **crash detection (including re-arming after a retry
 **embed timeout and cleanup**, **the loading indicator being visibly painted during
 the blocking wait** (measured with a positive control), system-wide hotkey
 registration/release/fallback, both print modes' exact command lines, the
-`EnabledExtensions` filter through the real INI reader, the Sumatra-not-found path,
-and `PATH`-only discovery. The exact arguments Sumatra receives were checked
+`EnabledExtensions`/`ExtraExtensions` through the real INI reader (including per-extension
+sections applying to extra types), **real version-resource parsing against fakes stamped as
+Sumatra 3.3 and 3.7** (advisories for `search=`, OFD and RTF on the old one, none on the new),
+the Sumatra-not-found path, and `PATH`-only discovery. The exact arguments Sumatra receives were checked
 byte-for-byte, including an `InverseSearchCommand` with its own quoting.
 
 **Builds:** real CMake builds with MinGW-w64 for both architectures; the produced
@@ -128,7 +133,8 @@ DLLs import only Windows system DLLs (no MinGW runtime), and all 15 functions ar
 Wine + Xvfb, which has no window manager — e.g. forwarded keystrokes for find/copy
 reach the fake but their effect inside real Sumatra is untested); and an **MSVC** build
 of this version (none was available; the `/MT` runtime setting in `CMakeLists.txt` is
-standard CMake but unexercised here).
+standard CMake but unexercised here). Also untested: that a real SumatraPDF opens the extra types in `-plugin` mode (Sumatra's documentation
+says it can open them; this was not run against it) — notably CAJ, whose first use prompts for a converter download.
 
 **Bugs found by this process, beyond the API errors above:** command-line quoting
 that could be broken out of by a crafted value (now verified safe); the diagnostic
@@ -143,7 +149,9 @@ producing DLLs that depend on `libstdc++-6.dll`; `LNK4070` from a hard-coded
 a real run produced; fixed by `%ls` everywhere and by avoiding printf for handles);
 and a **binary-planting weakness** in the `PATH` fallback (`SearchPathW(nullptr,…)`
 also searches the current directory, which in Total Commander is often a folder the
-user is browsing — found when a test double in the working directory got launched).
+user is browsing — found when a test double in the working directory got launched). The format list had also gone **stale**: it missed types current SumatraPDF opens (OFD, AZW/AZW3,
+FBZ/ZFB2, DJV, AI, and the opt-in ones). Another developer pointed that out, and it was checked against
+Sumatra's own "Supported document formats" page rather than taken on trust.
 
 ## How it works
 
@@ -214,8 +222,17 @@ name always mismatches one of them. Total Commander loads the plugin with
 
 ## Supported extensions
 
-`PDF CHM DJVU EPUB FB2 FB2Z MOBI PRC XPS OXPS CB7 CBR CBT CBZ` — trim with
-`EnabledExtensions=` (it can't add formats Sumatra can't open).
+**Claimed by default (21):** `PDF AI EPUB MOBI PRC AZW AZW3 FB2 FB2Z FBZ ZFB2 DJVU DJV CHM XPS OXPS OFD CB7 CBR CBT CBZ`
+— document and e-book formats that SumatraPDF opens (per its own *Supported document formats* page) and
+that Total Commander has no built-in viewer for. `OFD` needs Sumatra 3.7+.
+
+**Opt in with `ExtraExtensions=`:** anything else your SumatraPDF can open — Markdown (`MD`), plain text,
+images, RTF, SVG, Palm DOC, CAJ/KDH/NH, Microsoft Reader, and so on (the INI lists them with notes).
+These are deliberately **not** claimed by default, because claiming a type replaces Total Commander's own
+viewer for every file of that type (it views text and images well itself), `.pdb` doubles as the debug-symbol
+format developers have plenty of, and CAJ's first use prompts for a converter download. The plugin passes
+the list through rather than hard-coding more formats, so it doesn't go stale when Sumatra adds one;
+`EnabledExtensions=` trims the combined list. HTML pages are not a Sumatra format (CHM compiled help is).
 
 ## Notes / limitations
 
@@ -223,6 +240,11 @@ name always mismatches one of them. Total Commander loads the plugin with
   around a whole value — harmless for a path, but it corrupts a command like
   `"C:\Program Files\Editor\ed.exe" -n%l "%f"`. Wrap such values in *single* quotes
   (`'…'`); the INI file explains and gives examples. Verified against the real reader.
+- **Inverse search is triggered by double-clicking** in the PDF (not Ctrl+click — an
+  earlier version of the INI said that, and it was wrong) and needs SyncTeX data next to the
+  PDF (compile with `-synctex=1`). Sumatra's own documentation recommends setting the command
+  once inside Sumatra rather than passing it on every launch, which is also what avoids the
+  persistence side effect below.
 - **`BackgroundColor=` and `InverseSearchCommand=` are persistent and deprecated** in
   Sumatra itself (see *API correctness*). Leave them blank unless you accept that they
   also change Sumatra when you use it outside this plugin.
@@ -238,6 +260,16 @@ name always mismatches one of them. Total Commander loads the plugin with
   remappable. If a combination is already taken, registration fails quietly (see the log).
 - **Executable discovery never uses the current directory** (see *Bugs found*): only
   registry, standard install folders, the plugin's own folder, and absolute `PATH` entries.
+- **Claiming a file type replaces Total Commander's own viewer for ALL files of that type**, which is why
+  Markdown, plain text, images, RTF, SVG and `.pdb` are opt-in. Total Commander may also keep the detect
+  string it stored when the plugin was first added: after changing the lists, restart it and, if needed,
+  remove and re-add the plugin or edit the detect string.
+- **Other Sumatra-embedding plugins report a keyboard-navigation problem in Quick View** with Sumatra 3.5+
+  (Total Commander's own keys stop working after the embedded Sumatra takes focus; see sumatrapdf issue
+  #3798, reported against sLister). This plugin takes focus the same way and hasn't been tested with a real
+  Total Commander or Sumatra, so watch for it in Quick View.
+- **Related plugins:** sLister and TCSumatraPDF (Total Commander forum / totalcmd.net) take the same
+  embed-Sumatra approach. TCSumatraPDF's default list also includes `PDB`, which this plugin leaves opt-in.
 - **Per-extension night mode vs `AutoNightMode`:** `AutoNightMode=1` overrides every
   static night-mode setting, including `[EXT] NightMode=`.
 

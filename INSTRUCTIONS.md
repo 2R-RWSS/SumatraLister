@@ -4,6 +4,10 @@ Step-by-step guide to installing, configuring and troubleshooting the plugin. Fo
 works, what was tested and what wasn't, see `README.md`. Every setting is documented in
 detail in `SumatraLister.ini`.
 
+> **Heads-up:** the plugin was tested against a stand-in for SumatraPDF, not against a real
+> Total Commander, so the menu names below follow Total Commander's usual layout and may differ
+> slightly in your version. `README.md` lists exactly what is and isn't verified.
+
 ---
 
 ## 1. What you need
@@ -11,7 +15,7 @@ detail in `SumatraLister.ini`.
 - **Total Commander** — 64-bit (`TOTALCMD64.EXE`) or 32-bit (`TOTALCMD.EXE`). The plugin must
   match it: **`SumatraLister.wlx64` for 64-bit, `SumatraLister.wlx` for 32-bit.**
 - **SumatraPDF** installed (installer or portable). Get it from https://www.sumatrapdfreader.org/.
-  Any recent version works; `#search=` links need 3.4 or newer.
+  Any recent version works; `#search=` links need 3.4 or newer, and `.ofd` files need 3.7 or newer.
 - **The plugin file.** No prebuilt binary is included — build it first (section 2).
 
 ## 2. Build the plugin (once)
@@ -38,7 +42,7 @@ MinGW users: see *Building* in `README.md`.
 4. If another plugin already claims some of these extensions, move SumatraLister above it in the
    list — Total Commander uses the first plugin whose detect string matches.
 5. Select a PDF, EPUB, CBZ… and press **F3**. You should see "Opening in SumatraPDF…" for a
-   moment, then the document. **Ctrl+Q** (Quick View) works too.
+   moment, then the document. **Ctrl+Q** (Quick View) is supported as well.
 
 > Total Commander keeps plugin DLLs loaded while it runs, so **close it before replacing the
 > file** with a newer build.
@@ -46,7 +50,7 @@ MinGW users: see *Building* in `README.md`.
 ## 4. Everyday use
 
 - Once the document has focus, Sumatra's own keys apply: scrolling, page keys, zoom, and so on.
-- **Find:** Lister's Find (F7) opens Sumatra's own find bar. Ctrl+F inside the document works as well.
+- **Find:** Lister's Find (F7) is handed to Sumatra's own find bar. Ctrl+F inside the document works as well.
 - **Copy / Select all** from Lister's menu are forwarded to Sumatra. They work by sending keystrokes,
   so the Lister window must be in the foreground.
 - **Next / previous file** in Lister reuses the same pane.
@@ -54,6 +58,12 @@ MinGW users: see *Building* in `README.md`.
 - **File-list thumbnails** come from Windows' own thumbnail handlers, not from this plugin, so what
   you see depends on the handlers installed on your machine. Turn off with `ThumbnailsEnabled=0`.
 - If Sumatra stops unexpectedly, the pane says so instead of staying blank. Re-open the file to retry.
+
+**Which files does it open?** By default: PDF, AI, EPUB, MOBI/PRC/AZW/AZW3, FB2/FB2Z/FBZ/ZFB2, DjVu
+(DJVU/DJV), CHM, XPS/OXPS, OFD (needs Sumatra 3.7+) and comic archives (CBZ/CBR/CB7/CBT). Current
+SumatraPDF can open more — Markdown, plain text, images, RTF, CAJ and others — but claiming those would
+replace Total Commander's own viewers (or, for CAJ, trigger a converter-download prompt), so they're opt-in:
+see `ExtraExtensions=` in section 5. HTML pages aren't a Sumatra format.
 
 ## 5. Settings (`SumatraLister.ini`)
 
@@ -69,6 +79,7 @@ missing keys use the defaults. Some useful recipes (all under `[Settings]` unles
 | Open untrusted files more safely | `RestrictMode=1` (Sumatra's restricted mode; it can limit features such as saving, and possibly printing — see Sumatra's documentation) |
 | Different defaults for comics | add a section: `[CBZ]` then `DefaultView=continuous` and `DefaultZoom=fit width` (same for `[CBR]` etc.) |
 | Handle only some formats | `EnabledExtensions=PDF,EPUB` (see the note below) |
+| Also open Markdown, CAJ, RTF… | `ExtraExtensions=MD,CAJ` — the INI lists what is available and why these aren't on by default |
 | Give a slow machine more time to embed | `EmbedTimeoutMs=10000` (allowed range 500–30000) |
 | Open the file externally if embedding fails | `FallbackToShellOpen=1` |
 | Never show thumbnails from this plugin | `ThumbnailsEnabled=0` |
@@ -79,8 +90,8 @@ missing keys use the defaults. Some useful recipes (all under `[Settings]` unles
 - **Quotes.** Windows' INI reader silently removes one pair of quotes wrapping a whole value. That's
   fine for a path, but it corrupts a command like `"C:\Editor\ed.exe" -n%l "%f"`. Wrap such a value in
   *single* quotes: `InverseSearchCommand='"C:\Editor\ed.exe" -n%l "%f"'`.
-- **`EnabledExtensions` and Total Commander's stored list.** Total Commander may keep the detect
-  string it saw when the plugin was first added. After changing `EnabledExtensions`, restart; if the
+- **`EnabledExtensions`/`ExtraExtensions` and Total Commander's stored list.** Total Commander may keep the detect
+  string it saw when the plugin was first added. After changing either list, restart; if the
   old list still applies, remove and re-add the plugin or edit its detect string in the same
   Lister-plugins dialog. A non-blank value that matches nothing (a typo, or spaces instead of commas)
   enables *nothing*, by design.
@@ -118,8 +129,8 @@ If another program already owns the combination nothing happens — see Troubles
 A path handed to the plugin may carry parameters after `#`, combined with `&`:
 `C:\book.pdf#page=5&search=hello%20world`, `…#dest=Chapter3`, `…#forwardsearch=C%3A%5Csrc%5Cmain.tex:123`,
 `…#pwd=secret`. They only matter when *another tool* (a script, another plugin, a custom command) passes
-such a path to the plugin; an ordinary F3 on a file never has one, and I haven't verified a built-in
-Total Commander way to type one. Two cautions: `pwd=` places the password on Sumatra's command line,
+such a path to the plugin; an ordinary F3 on a file never has one, and no built-in
+Total Commander way to type one has been verified. Two cautions: `pwd=` places the password on Sumatra's command line,
 where other programs of the same user can read it; and `search=` needs Sumatra 3.4+.
 
 ## 9. Troubleshooting
@@ -138,6 +149,13 @@ open `SumatraLister.log` in the plugin's folder (it restarts itself at about 2 M
   then folders listed in `PATH` — **never the current directory**, on purpose.
 - **"SumatraPDF closed unexpectedly while viewing this file."** — usually a damaged file. Try it in
   Sumatra directly; re-open it to retry.
+- **A file type isn't opened by the plugin** — check that its extension is in the default list or in
+  `ExtraExtensions=`, isn't excluded by `EnabledExtensions=`, and that Total Commander's stored detect string
+  includes it (section 5: re-add the plugin or edit the detect string). `DebugLog=1` logs any invalid
+  `ExtraExtensions` entry. For CAJ files, open one once in Sumatra itself first to accept its converter download.
+- **Total Commander's keys stop working after clicking into the preview (Quick View)** — reported for other
+  Sumatra-embedding plugins with Sumatra 3.5 and later. This plugin hasn't been tested with a real Total
+  Commander, so please report it (with a diagnostic snapshot) if you see it.
 - **Another viewer still opens these files** — check the plugin order and detect string (section 3);
   another plugin may be matching first.
 - **A hotkey does nothing** — another program probably owns that combination. With `DebugLog=1` look for
