@@ -14,9 +14,17 @@ detail in `SumatraLister.ini`.
 
 - **Total Commander** — 64-bit (`TOTALCMD64.EXE`) or 32-bit (`TOTALCMD.EXE`). The plugin must
   match it: **`SumatraLister.wlx64` for 64-bit, `SumatraLister.wlx` for 32-bit.**
-- **SumatraPDF** installed (installer or portable). Get it from https://www.sumatrapdfreader.org/.
-  Any recent version works; `#search=` links need 3.4 or newer, and `.ofd` files need 3.7 or newer.
+- **SumatraPDF** installed (installer or portable). The download page on Sumatra's own site is
+  <https://www.sumatrapdfreader.org/download-free-pdf-viewer> — and `#search=` links need Sumatra 3.4 or
+  newer, `.ofd` files 3.7 or newer (3.7 was a pre-release build when this was checked; the stable
+  release was 3.6.1).
 - **The plugin file.** No prebuilt binary is included — build it first (section 2).
+
+> **Compatibility:** the plugin shows Sumatra inside Total Commander using Sumatra's `-plugin`
+> command-line mode. Sumatra's current documentation no longer lists that option, and other plugins that
+> embed Sumatra this way report problems with newer versions (Sumatra 3.5 and later in particular). **Test
+> with the Sumatra version you actually use.** If the preview pane says SumatraPDF "exited" or "did not
+> appear in this pane", see section 9 and `README.md` ("Compatibility").
 
 ## 2. Build the plugin (once)
 
@@ -61,9 +69,11 @@ MinGW users: see *Building* in `README.md`.
 
 **Which files does it open?** By default: PDF, AI, EPUB, MOBI/PRC/AZW/AZW3, FB2/FB2Z/FBZ/ZFB2, DjVu
 (DJVU/DJV), CHM, XPS/OXPS, OFD (needs Sumatra 3.7+) and comic archives (CBZ/CBR/CB7/CBT). Current
-SumatraPDF can open more — Markdown, plain text, images, RTF, CAJ and others — but claiming those would
-replace Total Commander's own viewers (or, for CAJ, trigger a converter-download prompt), so they're opt-in:
-see `ExtraExtensions=` in section 5. HTML pages aren't a Sumatra format.
+SumatraPDF can open more — plain text, images, RTF, CAJ and **Markdown** — but claiming those would replace
+Total Commander's own viewers (or, for CAJ, trigger a converter-download prompt), so they're opt-in: see
+`ExtraExtensions=` in section 5. Markdown is worth a look: Sumatra *renders* it (through WebView2 when that
+is installed, otherwise the older IE control) instead of showing the source, so enable `MD` if you read
+`.md` files more than you edit them. HTML pages aren't a Sumatra format.
 
 ## 5. Settings (`SumatraLister.ini`)
 
@@ -76,10 +86,11 @@ missing keys use the defaults. Some useful recipes (all under `[Settings]` unles
 | Follow Total Commander's light/dark theme | `AutoNightMode=1` (needs a Total Commander version that sends the Lister dark-mode notification, TC 10 or newer) |
 | Always read in inverted colours | `NightMode=1` |
 | Use a portable or non-standard Sumatra | `SumatraPath=D:\Tools\SumatraPDF\SumatraPDF.exe` |
-| Open untrusted files more safely | `RestrictMode=1` (Sumatra's restricted mode; it can limit features such as saving, and possibly printing — see Sumatra's documentation) |
-| Different defaults for comics | add a section: `[CBZ]` then `DefaultView=continuous` and `DefaultZoom=fit width` (same for `[CBR]` etc.) |
+| Open untrusted files more safely | `RestrictMode=1` — Sumatra then turns **everything** restricted off: document links, printing, copying text and saving settings (so Lister's Copy and Print won't work) |
+| Different defaults for comics | add a section: `[CBZ]` then `DefaultView=continuous single page` and `DefaultZoom=fit width` (same for `[CBR]` etc.) |
 | Handle only some formats | `EnabledExtensions=PDF,EPUB` (see the note below) |
-| Also open Markdown, CAJ, RTF… | `ExtraExtensions=MD,CAJ` — the INI lists what is available and why these aren't on by default |
+| Also open Markdown (rendered), CAJ, RTF… | `ExtraExtensions=MD,CAJ` — the INI lists what is available and why these aren't on by default |
+| Keep the plugin's Sumatra away from my own Sumatra settings | `SettingsDir=%LOCALAPPDATA%\SumatraLister` — the embedded Sumatra gets its own settings file; copy your `SumatraPDF-settings.txt` in to carry preferences over |
 | Give a slow machine more time to embed | `EmbedTimeoutMs=10000` (allowed range 500–30000) |
 | Open the file externally if embedding fails | `FallbackToShellOpen=1` |
 | Never show thumbnails from this plugin | `ThumbnailsEnabled=0` |
@@ -118,10 +129,10 @@ If another program already owns the combination nothing happens — see Troubles
 - **Best way to set the command: once, inside Sumatra** (press Ctrl+K in a running Sumatra window and
   choose "Set Inverse Search Command Line", or use its Settings/Options, depending on version). That's
   what Sumatra's documentation recommends.
-- The plugin can also supply it via `InverseSearchCommand=`, but Sumatra stores that **permanently in
-  its own settings file on every launch**, which also affects Sumatra outside this plugin — and
-  Sumatra marks the switch as deprecated. Prefer the one-time setup unless you want the plugin to
-  manage it.
+- The plugin can also supply it via `InverseSearchCommand=`. Sumatra's current documentation doesn't say
+  whether that gets stored, but the command line *is* Sumatra's own `InverseSearchCmdLine` setting, so it
+  probably does — which would also affect Sumatra outside this plugin. Prefer the one-time setup, or set
+  `SettingsDir=` so the plugin's Sumatra uses its own settings.
 - If double-clicking does nothing, check Sumatra's `EnableTeXEnhancements` setting.
 
 ## 8. Deep links (advanced)
@@ -142,20 +153,30 @@ open `SumatraLister.log` in the plugin's folder (it restarts itself at about 2 M
   needs 64-bit Total Commander, `.wlx` needs 32-bit), or a build that depends on a runtime that isn't
   installed. The CMake build is set up to avoid that (static runtime); a hand-built DLL may not be.
 - **"SumatraPDF could not be found or started."** — Sumatra isn't installed, or isn't where the plugin
-  looks. Set `SumatraPath=`. **The same message also appears when Sumatra *was* found but didn't embed
-  within `EmbedTimeoutMs`** — the log tells the two cases apart (look for `Resolved SumatraPDF.exe:` and
-  `did not reparent`). Try a larger `EmbedTimeoutMs`, and check that Sumatra starts normally by itself.
-  The plugin looks, in order, at `SumatraPath`, the registry, standard install folders, its own folder,
-  then folders listed in `PATH` — **never the current directory**, on purpose.
+  looks. Install it from <https://www.sumatrapdfreader.org/download-free-pdf-viewer> or set `SumatraPath=`.
+  The plugin looks, in order, at `SumatraPath`, the registry, standard install folders, its own folder, then
+  folders listed in `PATH` — **never the current directory**, on purpose.
+- **"SumatraPDF exited (code N) before it could be shown here."** — Sumatra started and ended straight away.
+  Likely causes: this SumatraPDF version can't open that file type; the same file is already open in another
+  SumatraPDF window (close it and retry); or this version no longer supports being embedded (`README.md`,
+  "Compatibility"). With `DebugLog=1` the log records the exit code.
+- **"SumatraPDF started but did not appear in this pane in time."** — Sumatra kept running but never showed up
+  inside the pane. Try a larger `EmbedTimeoutMs`; if it still fails, this version may not support embedding.
+  You might see an ordinary SumatraPDF window flash on screen first.
+- **"OFD files need SumatraPDF 3.7 or newer (installed: …)."** (also RTF and LIT) — that file type needs a newer
+  Sumatra than the one the plugin found. Update it; 3.7 and later may be pre-release builds, listed at
+  <https://www.sumatrapdfreader.org/prerelease>.
 - **"SumatraPDF closed unexpectedly while viewing this file."** — usually a damaged file. Try it in
   Sumatra directly; re-open it to retry.
 - **A file type isn't opened by the plugin** — check that its extension is in the default list or in
   `ExtraExtensions=`, isn't excluded by `EnabledExtensions=`, and that Total Commander's stored detect string
   includes it (section 5: re-add the plugin or edit the detect string). `DebugLog=1` logs any invalid
   `ExtraExtensions` entry. For CAJ files, open one once in Sumatra itself first to accept its converter download.
-- **Total Commander's keys stop working after clicking into the preview (Quick View)** — reported for other
-  Sumatra-embedding plugins with Sumatra 3.5 and later. This plugin hasn't been tested with a real Total
-  Commander, so please report it (with a diagnostic snapshot) if you see it.
+- **Esc, N or P don't act on Total Commander, or its keys stop working after clicking into the preview
+  (Quick View)** — reported for other Sumatra-embedding plugins (Sumatra 3.5 and later): while the embedded
+  Sumatra has keyboard focus, keys go to it rather than to Total Commander's Lister. This plugin doesn't forward
+  them and hasn't been tested with a real Total Commander, so please report what you see (with a diagnostic
+  snapshot).
 - **Another viewer still opens these files** — check the plugin order and detect string (section 3);
   another plugin may be matching first.
 - **A hotkey does nothing** — another program probably owns that combination. With `DebugLog=1` look for
@@ -163,8 +184,9 @@ open `SumatraLister.log` in the plugin's folder (it restarts itself at about 2 M
 - **My settings aren't applied** — restart Total Commander; check the file is named exactly
   `SumatraLister.ini` and sits next to the plugin DLL.
 - **Sumatra looks different when I use it on its own** — you probably set `BackgroundColor=` or
-  `InverseSearchCommand=`; Sumatra saves those permanently (see the INI). Blank them here, then reset the
-  value in Sumatra itself (for the colour, the `MainWindowBackground` value in its settings file).
+  `InverseSearchCommand=`; Sumatra may store those (see the INI). Blank them here, then reset the value in Sumatra
+  itself (for the colour, the `MainWindowBackground` value in its settings file) — or set `SettingsDir=` so the
+  plugin's Sumatra uses its own settings from now on.
 
 **Reporting a problem:** set `EnableDiagnosticHotkey=1` and `DebugLog=1`, restart, reproduce the problem,
 and with a Lister pane open press the diagnostic hotkey (default `Ctrl+Alt+D`). A message confirms the

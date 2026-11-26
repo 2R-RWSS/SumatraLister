@@ -13,6 +13,51 @@ Package contents: `SumatraLister.cpp` (the plugin, single file), `SumatraLister.
 
 ---
 
+## Compatibility — read this first
+
+This plugin works by launching `SumatraPDF.exe -plugin <window handle> <file>`, which makes Sumatra
+create its window *inside* a window the plugin provides. **That option is not listed in SumatraPDF's
+current command-line reference** (re-read in November 2026; its pages describe the 3.7 pre-release, while
+the stable release was 3.6.1), and the same page says Sumatra treats anything it doesn't recognise as an
+option as a file name. What is publicly known:
+
+- Other Total Commander plugins that embed Sumatra this way report trouble with newer versions. sLister has
+  an open issue ([sumatrapdf #3798](https://github.com/sumatrapdfreader/sumatrapdf/issues/3798)) in which
+  Sumatra 3.5 and later stops Total Commander's keyboard navigation working in Quick View, and the author
+  of TCSumatraPDF wrote in 2023 that he "had to completely rewrite the plugin" to run Sumatra as a
+  separate program instead of using its embedding capabilities.
+- Whether embedding still works in *your* Sumatra build can only be found out by trying it. **This plugin
+  has been tested against a stand-in for SumatraPDF only — never against a real SumatraPDF or Total
+  Commander.** Please test with your actual versions before relying on it.
+
+If embedding doesn't work, the plugin says so instead of showing a blank pane (all verified against the
+stand-in):
+
+- Sumatra **exits at once** (it doesn't honour `-plugin`, or it handed the file to an already-running
+  window): noticed immediately rather than after the timeout; the pane says "SumatraPDF exited (code N)…"
+  and `DebugLog=1` records the exit code.
+- Sumatra **keeps running but never appears** in the pane within `EmbedTimeoutMs`: it is terminated and the
+  pane says it did not appear in time.
+- Sumatra is **too old for that file type** (OFD, RTF, LIT need 3.7+): the pane names the type, the
+  minimum version and the installed version.
+- With `FallbackToShellOpen=1` the file is also opened in its default application.
+
+What a Sumatra that ignores `-plugin` would probably look like — an inference from the documentation, not
+something observed: it would treat `-plugin` and the window number as file names and open the real file in
+an ordinary SumatraPDF window, which the plugin then closes after the timeout, so you might see a normal
+Sumatra window flash on screen before the "did not appear in time" message.
+
+Also reported for cross-process embedding, and not handled here: while the embedded Sumatra has keyboard
+focus, keys that Total Commander's Lister uses itself (Esc, N/P for next/previous file, the 1–8 mode keys)
+go to Sumatra, not to Total Commander; TCSumatraPDF's notes list N and P as keys both programs want.
+Sumatra also documents that page/view/zoom/destination commands go to an already-running SumatraPDF when the
+document is open there (its `ReuseInstance` setting); whether `-plugin` launches are exempt is unknown, so a
+file that is open in a normal Sumatra window may show the "exited" pane.
+
+Options if embedding fails with your Sumatra: point `SumatraPath=` at an older build (the issue thread says
+older versions still work), use one of the other plugins, or consider a variant that runs Sumatra as a
+separate program (not built, and not testable without a real Sumatra).
+
 ## API correctness
 
 An earlier version of this plugin was written largely from memory of the Total
@@ -31,11 +76,18 @@ command-line reference) and, where possible, by actually running the code:
 - **`-forward-search` takes the PDF as its own third argument**
   (`-forward-search "<source>" <line> "<pdf>"`), not via the trailing file argument
   that `-page`/`-named-dest` use. An earlier version got this wrong.
-- **Two Sumatra options persist globally.** Sumatra's own documentation lists
-  `-bg-color` and `-inverse-search` as writing into the user's
-  `SumatraPDF-settings.txt` on every launch (and as deprecated). Both are opt-in here
-  (off by default) and the INI says so at the point of use. `-invertcolors`, which
-  night mode uses, is *not* in that list.
+- **Sumatra's settings-file side effects.** `-bg-color` is documented as deprecated and as only setting a
+  value in `SumatraPDF-settings.txt`. `-inverse-search` is an ordinary option whose command line is
+  Sumatra's `InverseSearchCmdLine` setting — an earlier version of this README, following older
+  documentation, called it deprecated and persistent; the current page says neither, so treat persistence as
+  likely rather than documented. Both are opt-in here, and `SettingsDir=` confines such writes to a private
+  folder via `-appdata`. `-invertcolors` (alias of `-invert-colors`) is documented as affecting only the
+  current run, but is listed among Sumatra's deprecated options, so a future version may remove it.
+- **Documented names, not remembered ones.** `-view` takes `continuous single page` and so on (this
+  plugin's INI used to suggest plain `continuous`; it is now mapped). `-bg-color` is documented with a
+  leading `#` (a bare hex value now gets one). Silent printing is judged by Sumatra's documented exit
+  codes 2–6, not merely by Sumatra exiting.
+- **`-plugin` itself is not in the current reference at all** — see *Compatibility*.
 
 ## Features
 
@@ -69,6 +121,14 @@ command-line reference) and, where possible, by actually running the code:
 - **Crash detection**: if the embedded Sumatra process dies, the pane says so (and,
   with `FallbackToShellOpen=1`, opens the file in its default app) instead of staying
   a dead blank window. Implemented with a thread-pool wait on the process handle.
+- **Says *why* a preview failed, and fast**: Sumatra missing; Sumatra exited at once (with its exit code);
+  started but never appeared in the pane; or too old for that file type. A Sumatra that has already exited
+  is noticed immediately instead of after the whole `EmbedTimeoutMs` (88 ms against a 4000 ms timeout in the
+  stand-in test).
+- **Optional private settings folder** (`SettingsDir=`, passed as `-appdata`) so the embedded and print
+  launches of Sumatra never touch your own SumatraPDF settings, recent files or window state.
+- **Silent printing reports failure properly**: Sumatra's documented exit codes (2–6) decide the result,
+  instead of "Sumatra exited, so it must have worked".
 - **"Opening in SumatraPDF…" indicator** during the (sometimes multi-second) embed
   wait, painted synchronously before the UI thread blocks; dark-aware.
 - **Sumatra version detection**: reads `SumatraPDF.exe`'s version resource and logs a
@@ -98,17 +158,18 @@ What was actually done, and what was not.
 helpers), four standard Win32 `(HBRUSH)(COLOR_WINDOW+1)`/`(WNDPROC)` int-to-pointer
 idioms, `LogF`'s deliberate C-variadic, and the `_UNICODE` macro Windows requires.
 
-**Unit-level (233 assertions)** on code extracted *verbatim* from the shipped source
+**Unit-level (267 assertions)** on code extracted *verbatim* from the shipped source
 and run under Wine: the hotkey parser (15 valid forms, 20 rejected forms), URL
 decoding edge cases, the deep-link parser (including a real file with a literal `#`
 in its name), command-line quoting round-tripped through the real
 `CommandLineToArgvW` (embedded quotes, trailing backslashes, an injection attempt,
 editor commands with their own inner quotes), the forward-search argument shape,
 the `EnabledExtensions` and `ExtraExtensions` parsers (including attempts to smuggle
-detect-string syntax through an extension entry), the default-claim policy, and the Sumatra
-version comparison and per-file-type minimum-version table.
+detect-string syntax through an extension entry), the default-claim policy, the Sumatra
+version comparison and per-file-type minimum-version table, the `-bg-color` / `-view` normalisation,
+the print exit-code table, and settings-folder resolution (including `%ENVIRONMENT%` variables).
 
-**End-to-end (284 checks, 16 scenarios)** by loading the real built plugin DLL under
+**End-to-end (712 checks, 30 scenarios)** by loading the real built plugin DLL under
 Wine on a virtual display, against a fake `SumatraPDF.exe` that mimics `-plugin`
 embedding (it creates a cross-process child window of the given HWND and records its
 exact argv): embedding and window ownership, resize following, `ITM_FOCUS`
@@ -123,6 +184,17 @@ sections applying to extra types), **real version-resource parsing against fakes
 Sumatra 3.3 and 3.7** (advisories for `search=`, OFD and RTF on the old one, none on the new),
 the Sumatra-not-found path, and `PATH`-only discovery. The exact arguments Sumatra receives were checked
 byte-for-byte, including an `InverseSearchCommand` with its own quoting.
+
+Also exercised end to end: **how an embed failure is reported** (Sumatra exiting at once is noticed in
+about 50–90 ms instead of after the 4000 ms timeout; a running-but-windowless Sumatra is terminated; a too-old
+Sumatra is named in the pane; the pane recovers on the next file), **silent printing against every
+exit code Sumatra documents**, **`SettingsDir`** (relative path, `%ENV%` expansion, a space in the path, the
+folder created, applied to print launches too), and code paths **no earlier test had run**: every ANSI export
+(including a non-ASCII path), `ListSetDefaultParams`, thumbnails (enabled and disabled), **unloading the DLL
+with a live pane and loading it again**, **exiting the host process with a pane open** (Sumatra is terminated),
+two panes at once (a crash in one leaves the other alone), clipboard restoration after search forwarding, and
+a stress run (a background thread making ~375,000 thumbnail calls while the UI thread switches files with
+copy and search: no deadlock, no orphaned processes).
 
 **Builds:** real CMake builds with MinGW-w64 for both architectures; the produced
 DLLs import only Windows system DLLs (no MinGW runtime), and all 15 functions are exported.
@@ -152,6 +224,16 @@ also searches the current directory, which in Total Commander is often a folder 
 user is browsing — found when a test double in the working directory got launched). The format list had also gone **stale**: it missed types current SumatraPDF opens (OFD, AZW/AZW3,
 FBZ/ZFB2, DJV, AI, and the opt-in ones). Another developer pointed that out, and it was checked against
 Sumatra's own "Supported document formats" page rather than taken on trust.
+This round's re-check against Sumatra's *current* command-line reference found more of the same kind: the INI
+recommended `DefaultView=continuous` (not a documented view name) and a bare `2B2B2B` background colour
+(documented with a `#`); the docs called `-inverse-search` deprecated and persistent (stale: the current page
+says neither); a source comment claimed every flag including `-plugin` had been checked against that
+reference (`-plugin` is not in it); silent printing reported success whenever Sumatra merely exited,
+ignoring its documented exit codes; a Sumatra that had already exited was waited on for the full embed
+timeout; `RestrictMode`'s description understated that it also disables printing and copying; the INI's
+`ExtraArgs` example (`-esc-to-exit`) would make Esc kill the embedded Sumatra; the source claimed the Sumatra
+process is reused across next-file navigation (only the pane is); and the download address in the error pane
+and the guide was replaced with the one Sumatra's own site links to (a user reported the old one failing).
 
 ## How it works
 
@@ -224,15 +306,19 @@ name always mismatches one of them. Total Commander loads the plugin with
 
 **Claimed by default (21):** `PDF AI EPUB MOBI PRC AZW AZW3 FB2 FB2Z FBZ ZFB2 DJVU DJV CHM XPS OXPS OFD CB7 CBR CBT CBZ`
 — document and e-book formats that SumatraPDF opens (per its own *Supported document formats* page) and
-that Total Commander has no built-in viewer for. `OFD` needs Sumatra 3.7+.
+that Total Commander has no built-in viewer for. `OFD` needs Sumatra 3.7+, a pre-release build when this was
+checked (November 2026; the stable release was 3.6.1) — on an older Sumatra the pane says so.
 
-**Opt in with `ExtraExtensions=`:** anything else your SumatraPDF can open — Markdown (`MD`), plain text,
-images, RTF, SVG, Palm DOC, CAJ/KDH/NH, Microsoft Reader, and so on (the INI lists them with notes).
-These are deliberately **not** claimed by default, because claiming a type replaces Total Commander's own
-viewer for every file of that type (it views text and images well itself), `.pdb` doubles as the debug-symbol
-format developers have plenty of, and CAJ's first use prompts for a converter download. The plugin passes
-the list through rather than hard-coding more formats, so it doesn't go stale when Sumatra adds one;
-`EnabledExtensions=` trims the combined list. HTML pages are not a Sumatra format (CHM compiled help is).
+**Opt in with `ExtraExtensions=`:** anything else your SumatraPDF can open — plain text, images, RTF, SVG,
+Palm DOC, CAJ/KDH/NH, Microsoft Reader, and **Markdown (`MD`)**, which Sumatra *renders*: GitHub-flavored
+Markdown shown through an embedded browser (WebView2 when it is installed, otherwise the older IE control —
+the same one CHM uses). The INI lists them with notes. These are deliberately **not** claimed by default,
+because claiming a type replaces Total Commander's own viewer for every file of that type (it views text and
+images well itself; for `.md` that means trading its source view for the rendered one, which is worth it if
+you read Markdown rather than edit it), `.pdb` doubles as the debug-symbol format developers have plenty of,
+and CAJ's first use prompts for a converter download. The plugin passes the list through rather than
+hard-coding more formats, so it doesn't go stale when Sumatra adds one; `EnabledExtensions=` trims the
+combined list. HTML pages are not a Sumatra format (CHM compiled help is).
 
 ## Notes / limitations
 
@@ -242,12 +328,16 @@ the list through rather than hard-coding more formats, so it doesn't go stale wh
   (`'…'`); the INI file explains and gives examples. Verified against the real reader.
 - **Inverse search is triggered by double-clicking** in the PDF (not Ctrl+click — an
   earlier version of the INI said that, and it was wrong) and needs SyncTeX data next to the
-  PDF (compile with `-synctex=1`). Sumatra's own documentation recommends setting the command
-  once inside Sumatra rather than passing it on every launch, which is also what avoids the
-  persistence side effect below.
-- **`BackgroundColor=` and `InverseSearchCommand=` are persistent and deprecated** in
-  Sumatra itself (see *API correctness*). Leave them blank unless you accept that they
-  also change Sumatra when you use it outside this plugin.
+  PDF (compile with `-synctex=1`). Setting the command once inside Sumatra (Ctrl+K, *Set Inverse
+  Search Command Line*) is the cleanest route; passing it from the INI on every launch probably stores
+  it in Sumatra's settings (see *API correctness*).
+- **`BackgroundColor=` (documented as deprecated, and as only setting a value in Sumatra's settings
+  file) and `InverseSearchCommand=` (probably stored as well) can change how Sumatra behaves outside
+  this plugin.** Leave them blank, or set `SettingsDir=` so they only touch a private settings folder.
+- **`RestrictMode=1` turns *everything* restricted off**, per Sumatra's documentation: file-system,
+  registry and internet access (so document links don't open), printing, copying selected text, and saving
+  settings. That suits untrusted files, but Lister's Copy and Print commands then don't work and silent
+  printing fails with exit code 6.
 - **Find / copy / select-all** are forwarded as synthesized keystrokes (Sumatra has no
   message-based remote-control API), so Lister must be the foreground window.
   `LCS_MATCHCASE`/`LCS_WHOLEWORDS` aren't translated (no confirmed Sumatra hotkeys), and
@@ -264,10 +354,9 @@ the list through rather than hard-coding more formats, so it doesn't go stale wh
   Markdown, plain text, images, RTF, SVG and `.pdb` are opt-in. Total Commander may also keep the detect
   string it stored when the plugin was first added: after changing the lists, restart it and, if needed,
   remove and re-add the plugin or edit the detect string.
-- **Other Sumatra-embedding plugins report a keyboard-navigation problem in Quick View** with Sumatra 3.5+
-  (Total Commander's own keys stop working after the embedded Sumatra takes focus; see sumatrapdf issue
-  #3798, reported against sLister). This plugin takes focus the same way and hasn't been tested with a real
-  Total Commander or Sumatra, so watch for it in Quick View.
+- **Quick View and keyboard focus:** other Sumatra-embedding plugins report that Sumatra 3.5+ interferes
+  with Total Commander's keyboard navigation in Quick View, and that Lister keys such as Esc and N/P reach
+  Sumatra instead of Total Commander (see *Compatibility*). Untested here with a real Total Commander.
 - **Related plugins:** sLister and TCSumatraPDF (Total Commander forum / totalcmd.net) take the same
   embed-Sumatra approach. TCSumatraPDF's default list also includes `PDB`, which this plugin leaves opt-in.
 - **Per-extension night mode vs `AutoNightMode`:** `AutoNightMode=1` overrides every

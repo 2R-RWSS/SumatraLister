@@ -27,7 +27,8 @@
 //     optional manual override via SumatraLister.ini.
 //   - INI-configurable launch options: default zoom, default view mode,
 //     page-surround background colour, night/inverted-colour mode,
-//     restricted (sandboxed) mode, embed timeout, EnabledExtensions (trim)
+//     restricted mode (-restrict, which per Sumatra turns printing, copy,
+//     links and saving of its settings off), embed timeout, EnabledExtensions (trim)
 //     and ExtraExtensions (add) lists of the file types claimed (so newer
 //     SumatraPDF formats -- Markdown, OFD, CAJ, RTF... -- need no code
 //     change), per-[EXT]-section overrides (e.g. different defaults for
@@ -96,8 +97,17 @@
 //   - Optional fallback (FallbackToShellOpen=1): if Sumatra can't be found
 //     or embedded, opens the file with its default Windows handler instead
 //     of just showing an error message.
-//   - Reuses one embedded Sumatra process across ListLoadNext (Lister's
-//     "next file" navigation) instead of recreating the host window.
+//   - Reuses the same Lister pane (host window) across ListLoadNext
+//     (Lister's "next file" navigation); SumatraPDF itself is restarted for
+//     each file.
+//   - Explains WHY a preview failed instead of one generic message: Sumatra
+//     missing, Sumatra exited at once (with its exit code), started but never
+//     appeared in the pane, or too old for that file type. A Sumatra that has
+//     already exited is detected immediately rather than waited on for the
+//     whole EmbedTimeoutMs.
+//   - Optional private SumatraPDF settings folder (SettingsDir=, passed as
+//     -appdata) so the embedded instance never touches the user's own
+//     SumatraPDF settings, recent files or window state.
 //   - Optional debug log (SumatraLister.log next to the DLL, auto-rotated
 //     past ~2MB) for troubleshooting detection/launch problems.
 //
@@ -108,16 +118,24 @@
 //  exact signature including ListPrint's RECT* Margins) have been verified
 //  against the official Total Commander Lister Plugin SDK
 //  (https://github.com/ghisler/WLX-SDK). Likewise, every SumatraPDF
-//  command-line flag used here (-plugin, -page, -named-dest, -search,
+//  command-line flag used here -- -page, -named-dest, -search,
 //  -forward-search, -inverse-search, -pwd, -bg-color, -invertcolors,
-//  -restrict, -zoom, -view, -print-to[-default], -print-dialog,
-//  -exit-when-done, -silent, -print-settings) has been checked against
-//  Sumatra's own official command-line reference rather than assumed from
-//  memory. Two of those (-bg-color, -inverse-search) are documented by
-//  Sumatra itself as deprecated AND as permanently writing into the user's
-//  SumatraPDF-settings.txt on every launch, not just affecting the current
-//  session -- both are opt-in INI settings here, off by default, with that
-//  behavior disclosed at the point of use. See README.md's "API
+//  -restrict, -zoom, -view, -appdata, -print-to[-default], -print-dialog,
+//  -exit-when-done, -silent, -print-settings -- except ONE was checked against
+//  Sumatra's own official command-line reference (last re-checked November
+//  2026) rather than assumed from memory. The exception is -plugin, the
+//  embedding mechanism this whole plugin is built on: the current reference
+//  does not list it at all (and says unrecognised options are treated as file
+//  names), and other Sumatra-embedding Total Commander plugins report
+//  problems with it since Sumatra 3.5; see README.md, "Compatibility".
+//  Other findings from that re-check: -bg-color is documented as deprecated
+//  and as only setting a value in the settings file; -invert-colors (older
+//  alias -invertcolors, used here for compatibility) is also listed among
+//  the deprecated options and may be removed; -inverse-search is a normal
+//  option, but its command line is the InverseSearchCmdLine setting, so
+//  expect it to be stored. -bg-color and -inverse-search are opt-in INI
+//  settings here with that disclosed at the point of use, and SettingsDir=
+//  confines such settings-file writes to a private folder. See README.md's "API
 //  correctness" section for the fuller account of what an earlier,
 //  unverified version of this file got wrong (a fabricated ListSendCommand
 //  implementation, a real ABI mismatch in ListPrint, and an incorrect
@@ -224,6 +242,13 @@
 #define ERRSTATE_NOT_FOUND        0  // Sumatra couldn't be found/started at all
 #define ERRSTATE_OPENED_EXTERNAL  1  // FallbackToShellOpen kicked in instead
 #define ERRSTATE_CRASHED          2  // was embedded and working, then the process exited unexpectedly
+#define ERRSTATE_EXITED           3  // started, but exited before it could be embedded (ListerInstance::lastExitCode)
+#define ERRSTATE_NO_EMBED         4  // started and still running, but never appeared in the pane within EmbedTimeoutMs
+#define ERRSTATE_TOO_OLD          5  // this file type needs a newer SumatraPDF than the installed one
+
+// Canonical pages on SumatraPDF's own site (the addresses its navigation links use).
+#define SUMATRA_DOWNLOAD_URL   L"https://www.sumatrapdfreader.org/download-free-pdf-viewer"
+#define SUMATRA_PRERELEASE_URL L"https://www.sumatrapdfreader.org/prerelease"
 
 // return codes
 #define LISTPLUGIN_OK       0
@@ -275,13 +300,15 @@ static const wchar_t* const kSupportedExtensions[] = {
 //
 //  [Settings]
 //  SumatraPath=C:\Tools\SumatraPDF\SumatraPDF.exe   ; manual override, optional
-//  ExtraArgs=-esc-to-exit                            ; appended verbatim
-//  RestrictMode=0                                    ; 1 = launch with -restrict
+//  ExtraArgs=-html-backend ie                        ; appended verbatim (that example needs Sumatra 3.7+)
+//  RestrictMode=0                                    ; 1 = launch with -restrict, which per Sumatra turns
+//                                                     ;     EVERY restricted feature off (printing, copy,
+//                                                     ;     links, saving settings...); see the INI
 //  NightMode=0                                       ; 1 = launch with -invertcolors
 //  AutoNightMode=0                                   ; 1 = follow TC's Lister light/dark theme instead
-//  DefaultZoom=                                      ; e.g. "fit page", "100", "fit width"
-//  DefaultView=                                      ; e.g. "continuous", "facing", "book view"
-//  BackgroundColor=                                  ; hex RGB, e.g. "2B2B2B"; forwarded to -bg-color
+//  DefaultZoom=                                      ; "fit page", "fit width", "fit height", "fit content", "fit visible" or a %
+//  DefaultView=                                      ; "single page", "continuous single page", "facing", "continuous facing", "book view", "continuous book view"
+//  BackgroundColor=                                  ; hex colour, e.g. "#2B2B2B" (a bare "2B2B2B" gets the "#"); -bg-color
 //                                                     ;     (the page-surround color, distinct from
 //                                                     ;     NightMode/-invertcolors' page/text inversion).
 //                                                     ;     CAUTION: -bg-color is deprecated and, per
@@ -294,9 +321,9 @@ static const wchar_t* const kSupportedExtensions[] = {
 //                                                     ;     "code.exe -g \"%f\":%l" -- lets double-clicking
 //                                                     ;     a location in the embedded PDF jump back to
 //                                                     ;     the LaTeX source in your editor (needs SyncTeX
-//                                                     ;     data next to the PDF). CAUTION: same
-//                                                     ;     persistent-settings-file caveat as
-//                                                     ;     BackgroundColor= above applies here too.
+//                                                     ;     data next to the PDF). Sumatra stores this as
+//                                                     ;     its InverseSearchCmdLine setting, so expect it
+//                                                     ;     to persist like BackgroundColor= (see SettingsDir=).
 //  EnabledExtensions=                                ; comma-separated allowlist, e.g. "PDF,EPUB,CBZ";
 //                                                     ;     empty (default) = every supported extension
 //                                                     ;     stays enabled. Trims what ListGetDetectString
@@ -307,6 +334,12 @@ static const wchar_t* const kSupportedExtensions[] = {
 //                                                     ;     for the known ones and the cautions). Each entry
 //                                                     ;     must be 1-10 letters/digits; others are ignored
 //                                                     ;     and logged.
+//  SettingsDir=                                      ; private SumatraPDF settings folder (-appdata) for the
+//                                                     ;     embedded and print launches, e.g.
+//                                                     ;     "%LOCALAPPDATA%\SumatraLister"; a relative path is
+//                                                     ;     relative to the plugin's folder. Keeps this plugin's
+//                                                     ;     Sumatra away from your own settings; the pop-out
+//                                                     ;     window still uses them.
 //  PrintSettings=                                    ; forwarded to -print-settings for ListPrint
 //  InteractivePrintFallback=1                        ; see README/ini for the full explanation
 //  ThumbnailsEnabled=1                               ; 1 = supply file-list thumbnails via Shell API
@@ -355,6 +388,7 @@ struct PluginConfig {
     std::wstring inverseSearchCommand;
     std::wstring enabledExtensions;  // empty = all; else comma-separated allowlist
     std::wstring extraExtensions;    // comma-separated extra extensions to claim, beyond kSupportedExtensions
+    std::wstring settingsDir;        // private SumatraPDF settings folder for embedded/print launches (-appdata); empty = Sumatra's own
     std::wstring printSettings;
     bool         interactivePrintFallback = true;
     bool         thumbnailsEnabled       = true;
@@ -607,6 +641,9 @@ static void LoadConfigImpl()
     GetPrivateProfileStringW(L"Settings", L"ExtraExtensions", L"", buf, _countof(buf), ini.c_str());
     g_config.extraExtensions = buf;
 
+    GetPrivateProfileStringW(L"Settings", L"SettingsDir", L"", buf, _countof(buf), ini.c_str());
+    g_config.settingsDir = buf;
+
     GetPrivateProfileStringW(L"Settings", L"PrintSettings", L"", buf, _countof(buf), ini.c_str());
     g_config.printSettings = buf;
 
@@ -757,6 +794,8 @@ struct ListerInstance {
     int                popOutHotkeyId = 0;     // RegisterHotKey id for pop-out, 0 = not registered
     int                diagHotkeyId   = 0;     // RegisterHotKey id for diagnostic snapshot, 0 = not registered
     HANDLE             processWaitHandle = nullptr; // RegisterWaitForSingleObject handle; see ProcessExitCallback
+    int                lastFailState = 0;       // ERRSTATE_* explaining why the last LaunchSumatraEmbedded failed
+    DWORD              lastExitCode  = 0;       // exit code of Sumatra when lastFailState == ERRSTATE_EXITED
     std::mutex         opLock;                 // serializes launch/relaunch/close for *this* instance,
                                                 // held independently of g_mutex (which only protects the
                                                 // map itself) so a slow relaunch on one Lister window never
@@ -779,6 +818,13 @@ using ListerInstancePtr = std::shared_ptr<ListerInstance>;
 static std::mutex                            g_mutex;
 static std::map<HWND, ListerInstancePtr>     g_instances; // keyed by hostWnd (== "ListWin" we return)
 static const wchar_t* HOST_CLASS_NAME        = L"SumatraListerHostWnd";
+
+// The error-pane state to show after a failed launch: the external-open note if the
+// FallbackToShellOpen handler took over, else the specific reason the launch failed.
+static int FailureState(const ListerInstance* inst, bool openedExternally)
+{
+    return openedExternally ? ERRSTATE_OPENED_EXTERNAL : inst->lastFailState;
+}
 
 // Thread-safe lookup helper: copies the shared_ptr out under g_mutex and
 // returns immediately, so callers never hold g_mutex while doing slow work
@@ -1522,14 +1568,26 @@ static void EnsureHostClassRegistered()
     });
 }
 
-static HWND WaitForSumatraChild(HWND hostWnd, HANDLE hProcess, DWORD processId, DWORD timeoutMs)
+// Waits for a child window owned by `processId` to appear inside hostWnd.
+// Returns it, or nullptr on failure. On failure *processExited tells whether
+// the process ENDED during the wait (with *exitCode) rather than merely not
+// showing up in time: a process that has already exited can never produce the
+// window, so the wait stops at once instead of polling out the rest of
+// EmbedTimeoutMs. That matters because "Sumatra exited immediately" is exactly
+// what a SumatraPDF that doesn't honour -plugin (or that hands the file to an
+// already-running window) looks like.
+static HWND WaitForSumatraChild(HWND hostWnd, HANDLE hProcess, DWORD processId, DWORD timeoutMs,
+                                bool* processExited, DWORD* exitCode)
 {
+    *processExited = false;
+    *exitCode = 0;
     DWORD start = GetTickCount();
 
     // Most of the wait is normally "process hasn't created its message
     // queue / main window yet". WaitForInputIdle blocks efficiently (no
     // busy polling) until Sumatra's main thread is ready to pump messages,
     // which is almost always already true by the time it reparents itself.
+    // It returns at once (WAIT_FAILED) if the process has already ended.
     DWORD idleBudget = timeoutMs > 1000 ? timeoutMs - 500 : timeoutMs / 2;
     WaitForInputIdle(hProcess, idleBudget);
 
@@ -1544,6 +1602,12 @@ static HWND WaitForSumatraChild(HWND hostWnd, HANDLE hProcess, DWORD processId, 
             child = GetWindow(child, GW_HWNDNEXT);
         }
         if (found) break;
+
+        if (WaitForSingleObject(hProcess, 0) == WAIT_OBJECT_0) {
+            *processExited = true;
+            GetExitCodeProcess(hProcess, exitCode);
+            break;
+        }
         Sleep(pollIntervalMs);
         if (pollIntervalMs < 50) pollIntervalMs = std::min(pollIntervalMs + 10, 50ul); // hard-cap at 50ms
     }
@@ -1677,6 +1741,110 @@ static void AppendQuotedArg(std::wstring& cmd, const std::wstring& arg)
 static long long HandleToInt64(void* handle)
 {
     return reinterpret_cast<intptr_t>(handle);
+}
+
+// Sumatra documents -bg-color with a leading '#' ("-bg-color #999999"). A bare
+// hex value -- what this plugin's own INI template used to show, "2B2B2B" --
+// is accepted here by adding the '#'. Anything already carrying '#' or '0x',
+// or not looking like a 6/8-digit hex colour at all, is passed through untouched.
+static std::wstring NormalizeColorArg(const std::wstring& raw)
+{
+    size_t first = raw.find_first_not_of(L" \t");
+    if (first == std::wstring::npos)
+        return std::wstring();
+    std::wstring v = raw.substr(first, raw.find_last_not_of(L" \t") - first + 1);
+    if (v[0] == L'#' || (v.size() > 2 && v[0] == L'0' && (v[1] == L'x' || v[1] == L'X')))
+        return v;
+    bool hex = (v.size() == 6 || v.size() == 8);
+    for (wchar_t c : v) {
+        if (!iswxdigit(c))
+            hex = false;
+    }
+    return hex ? L"#" + v : v;
+}
+
+// The -view modes Sumatra documents are "single page", "continuous single
+// page", "facing", "continuous facing", "book view" and "continuous book view".
+// Earlier versions of this plugin's INI advertised plain "continuous", which is
+// not in that list; map it to the documented name instead of passing along
+// something Sumatra's reference doesn't define. Everything else is untouched.
+static std::wstring NormalizeViewArg(const std::wstring& raw)
+{
+    size_t first = raw.find_first_not_of(L" \t");
+    if (first != std::wstring::npos &&
+        _wcsicmp(raw.substr(first, raw.find_last_not_of(L" \t") - first + 1).c_str(), L"continuous") == 0)
+        return L"continuous single page";
+    return raw;
+}
+
+// What Sumatra's documented exit codes for command-line printing (-print-to /
+// -print-to-default) mean, from the "Printing options" section of its
+// command-line reference. Failures inside the print spooler after the job is
+// submitted (out of paper, offline...) cannot be reported this way, per Sumatra.
+static const wchar_t* DescribePrintExitCode(DWORD code)
+{
+    switch (code) {
+        case 0: return L"success";
+        case 2: return L"couldn't open the file (not found or unsupported format)";
+        case 3: return L"the document doesn't allow printing";
+        case 4: return L"the printer (named, or default) doesn't exist";
+        case 5: return L"the printer driver / device failed";
+        case 6: return L"printing is disabled by restriction policy (RestrictMode=1 turns printing off)";
+        default: return L"an exit code Sumatra's documentation doesn't list";
+    }
+}
+
+// Resolves the SettingsDir= setting: surrounding whitespace/quotes dropped,
+// %ENVIRONMENT% variables expanded, a trailing slash removed (but "C:\" kept),
+// and a relative path made relative to the plugin's own folder. Returns an
+// empty string for an empty setting.
+static std::wstring ResolveSettingsDir(const std::wstring& raw, const std::wstring& moduleDir)
+{
+    size_t first = raw.find_first_not_of(L" \t");
+    if (first == std::wstring::npos)
+        return std::wstring();
+    std::wstring v = raw.substr(first, raw.find_last_not_of(L" \t") - first + 1);
+    if (v.size() >= 2 && v.front() == L'"' && v.back() == L'"')
+        v = v.substr(1, v.size() - 2);
+
+    DWORD need = ExpandEnvironmentStringsW(v.c_str(), nullptr, 0); // required size, including the terminating NUL
+    if (need > 0) {
+        std::wstring expanded(need, L'\0');
+        DWORD got = ExpandEnvironmentStringsW(v.c_str(), &expanded[0], need);
+        if (got > 0 && got <= need) {
+            expanded.resize(got - 1); // `got` counts the terminating NUL
+            v.swap(expanded);
+        }
+    }
+
+    while (v.size() > 1 && (v.back() == L'\\' || v.back() == L'/') && !(v.size() == 3 && v[1] == L':'))
+        v.pop_back();
+    if (v.empty())
+        return std::wstring();
+    if (PathIsRelativeW(v.c_str()))
+        v = moduleDir + L"\\" + v;
+    return v;
+}
+
+// The private SumatraPDF settings directory (-appdata), or empty if SettingsDir=
+// isn't set. Computed once, after the config has loaded.
+static const std::wstring& GetSettingsDir()
+{
+    static const std::wstring dir = ResolveSettingsDir(g_config.settingsDir, GetModuleDir());
+    return dir;
+}
+
+// Creates the private settings directory (and any missing parents), once.
+static void EnsureSettingsDirExists(const std::wstring& dir)
+{
+    static std::once_flag once;
+    std::call_once(once, [&dir]() {
+        int rc = SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+        if (rc != ERROR_SUCCESS && rc != ERROR_ALREADY_EXISTS && rc != ERROR_FILE_EXISTS)
+            LogF(L"Could not create SettingsDir %ls (error %d); SumatraPDF will be pointed at it anyway", dir.c_str(), rc);
+        else
+            LogF(L"Embedded SumatraPDF uses its own settings folder: %ls", dir.c_str());
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1883,14 +2051,26 @@ static bool LaunchSumatraEmbedded(ListerInstance* inst)
     }
     WORD minMajor = 0, minMinor = 0;
     const std::wstring openExt = GetExtensionUpper(filePath);
-    if (GetExtensionMinVersion(openExt, &minMajor, &minMinor) && !SumatraVersionAtLeast(minMajor, minMinor)) {
+    const bool fileTypeTooNew = GetExtensionMinVersion(openExt, &minMajor, &minMinor) &&
+                                !SumatraVersionAtLeast(minMajor, minMinor);
+    if (fileTypeTooNew) {
         LogF(L"%ls files need SumatraPDF %u.%u or newer; the installed version is %ls, so %ls may not open",
              openExt.c_str(), (unsigned)minMajor, (unsigned)minMinor, FormatSumatraVersion().c_str(), filePath.c_str());
     }
+    inst->lastFailState = ERRSTATE_NOT_FOUND; // refined below if the launch fails
 
     std::wstring cmdLine = L"\"" + exe + L"\"";
     AppendArg(cmdLine, L"-plugin");
     AppendArg(cmdLine, std::to_wstring(HandleToInt64(inst->hostWnd)));
+
+    // Optional private settings folder: keeps this embedded Sumatra's settings file (window state,
+    // recent files, -bg-color / -inverse-search values...) out of the user's own SumatraPDF settings.
+    const std::wstring& settingsDir = GetSettingsDir();
+    if (!settingsDir.empty()) {
+        EnsureSettingsDirExists(settingsDir);
+        AppendArg(cmdLine, L"-appdata");
+        AppendQuotedArg(cmdLine, settingsDir);
+    }
 
     bool filePathIncluded = AppendDeepLinkArgs(cmdLine, dl, filePath);
 
@@ -1903,11 +2083,11 @@ static bool LaunchSumatraEmbedded(ListerInstance* inst)
     }
     if (!effectiveView.empty()) {
         AppendArg(cmdLine, L"-view");
-        AppendQuotedArg(cmdLine, effectiveView);
+        AppendQuotedArg(cmdLine, NormalizeViewArg(effectiveView));
     }
     if (!g_config.backgroundColor.empty()) {
         AppendArg(cmdLine, L"-bg-color");
-        AppendQuotedArg(cmdLine, g_config.backgroundColor);
+        AppendQuotedArg(cmdLine, NormalizeColorArg(g_config.backgroundColor));
     }
     if (!g_config.inverseSearchCommand.empty()) {
         AppendArg(cmdLine, L"-inverse-search");
@@ -1949,10 +2129,25 @@ static bool LaunchSumatraEmbedded(ListerInstance* inst)
 
     inst->pi = pi;
 
-    HWND child = WaitForSumatraChild(inst->hostWnd, pi.hProcess, pi.dwProcessId, g_config.embedTimeoutMs);
+    bool exitedEarly = false;
+    DWORD earlyExitCode = 0;
+    HWND child = WaitForSumatraChild(inst->hostWnd, pi.hProcess, pi.dwProcessId, g_config.embedTimeoutMs,
+                                     &exitedEarly, &earlyExitCode);
     if (!child) {
-        LogF(L"Sumatra did not reparent within %lu ms (no -plugin support / crashed?)", g_config.embedTimeoutMs);
-        TerminateProcess(pi.hProcess, 0);
+        if (exitedEarly) {
+            LogF(L"SumatraPDF exited with code %lu before it could be embedded (it may not support -plugin, "
+                 L"may not open this file type, or may have handed the file to an already-running window)",
+                 earlyExitCode);
+            inst->lastFailState = ERRSTATE_EXITED;
+            inst->lastExitCode  = earlyExitCode;
+        } else {
+            LogF(L"Sumatra did not reparent within %lu ms (no -plugin support / crashed?)", g_config.embedTimeoutMs);
+            inst->lastFailState = ERRSTATE_NO_EMBED;
+            TerminateProcess(pi.hProcess, 0);
+        }
+        // An installed Sumatra too old for this file type explains the failure better than the generic states.
+        if (fileTypeTooNew)
+            inst->lastFailState = ERRSTATE_TOO_OLD;
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
         inst->pi = {};
@@ -2054,19 +2249,45 @@ static LRESULT CALLBACK ErrorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         SetBkMode(dc, TRANSPARENT);
 
         LONG_PTR state = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-        const wchar_t* msg1 = L"SumatraPDF could not be found or started.";
-        const wchar_t* msg2 = L"Install it from https://www.sumatrapdfreader.org/ "
-                               L"or place SumatraPDF.exe next to this plugin. "
-                               L"Enable DebugLog=1 in SumatraLister.ini for details.";
+        std::wstring m1 = L"SumatraPDF could not be found or started.";
+        std::wstring m2 = L"Install it from " SUMATRA_DOWNLOAD_URL L" or place SumatraPDF.exe next to this plugin "
+                          L"(or set SumatraPath= in SumatraLister.ini). Enable DebugLog=1 in SumatraLister.ini for details.";
         if (state == ERRSTATE_OPENED_EXTERNAL) {
-            msg1 = L"SumatraPDF could not be embedded here, so the file was opened in its default application instead.";
-            msg2 = L"Install SumatraPDF from https://www.sumatrapdfreader.org/ for an embedded preview here.";
+            m1 = L"SumatraPDF could not be embedded here, so the file was opened in its default application instead.";
+            m2 = L"Install SumatraPDF from " SUMATRA_DOWNLOAD_URL L" for an embedded preview here.";
         } else if (state == ERRSTATE_CRASHED) {
-            msg1 = L"SumatraPDF closed unexpectedly while viewing this file.";
-            msg2 = L"This usually means the file is corrupted or triggered a rendering "
-                   L"issue in SumatraPDF itself. Try a different file, or re-open this "
-                   L"one to try again. Enable DebugLog=1 in SumatraLister.ini for details.";
+            m1 = L"SumatraPDF closed unexpectedly while viewing this file.";
+            m2 = L"This usually means the file is corrupted or triggered a rendering "
+                 L"issue in SumatraPDF itself. Try a different file, or re-open this "
+                 L"one to try again. Enable DebugLog=1 in SumatraLister.ini for details.";
+        } else if (state == ERRSTATE_EXITED) {
+            ListerInstancePtr inst = FindInstance(hwnd);
+            m1 = L"SumatraPDF exited (code " + std::to_wstring(inst ? inst->lastExitCode : 0) +
+                 L") before it could be shown here.";
+            m2 = L"Possible causes: this SumatraPDF can't open this file type, the same file is already open in "
+                 L"another SumatraPDF window, or this version no longer supports embedding (see README.md). "
+                 L"Enable DebugLog=1 in SumatraLister.ini for details.";
+        } else if (state == ERRSTATE_NO_EMBED) {
+            m1 = L"SumatraPDF started but did not appear in this pane in time.";
+            m2 = L"Try a larger EmbedTimeoutMs in SumatraLister.ini. If it still fails, this SumatraPDF version may "
+                 L"no longer support embedding (see README.md). Enable DebugLog=1 in SumatraLister.ini for details.";
+        } else if (state == ERRSTATE_TOO_OLD) {
+            std::wstring what = L"This file type";
+            WORD mj = 0, mn = 0;
+            if (ListerInstancePtr inst = FindInstance(hwnd)) {
+                std::wstring p = inst->filePath;
+                ExtractDeepLinkParams(p);
+                const std::wstring e = GetExtensionUpper(p);
+                if (GetExtensionMinVersion(e, &mj, &mn))
+                    what = e + L" files";
+            }
+            m1 = what + L" need SumatraPDF " + std::to_wstring(mj) + L"." + std::to_wstring(mn) +
+                 L" or newer (installed: " + FormatSumatraVersion() + L").";
+            m2 = L"Update SumatraPDF from " SUMATRA_DOWNLOAD_URL L" -- new features can appear in pre-release "
+                 L"builds first: " SUMATRA_PRERELEASE_URL;
         }
+        const wchar_t* msg1 = m1.c_str();
+        const wchar_t* msg2 = m2.c_str();
 
         InflateRect(&rc, -10, -10);
         DrawTextW(dc, msg1, -1, &rc, DT_TOP | DT_LEFT | DT_WORDBREAK);
@@ -2333,6 +2554,7 @@ static std::wstring BuildDiagnosticSnapshot(const ListerInstance* inst)
     s += L"  InverseSearchCommand: "; s += (g_config.inverseSearchCommand.empty() ? L"(not set)" : L"(set)"); s += L"\r\n";
     s += L"  EnabledExtensions: " + (g_config.enabledExtensions.empty() ? std::wstring(L"(all)") : g_config.enabledExtensions) + L"\r\n";
     s += L"  ExtraExtensions: " + (g_config.extraExtensions.empty() ? std::wstring(L"(none)") : g_config.extraExtensions) + L"\r\n";
+    s += L"  SettingsDir: " + (GetSettingsDir().empty() ? std::wstring(L"(not set: SumatraPDF's own settings)") : GetSettingsDir()) + L"\r\n";
     s += L"  ThumbnailsEnabled: "; s += (g_config.thumbnailsEnabled ? L"1" : L"0"); s += L"\r\n";
     s += L"  EmbedTimeoutMs: " + std::to_wstring(g_config.embedTimeoutMs) + L"\r\n";
     s += L"  FallbackToShellOpen: "; s += (g_config.fallbackShellOpen ? L"1" : L"0"); s += L"\r\n";
@@ -2465,6 +2687,12 @@ static int DoListPrint(const std::wstring& fileToPrint, const std::wstring& prin
     }
     if (g_config.restrictMode)
         AppendArg(cmdLine, L"-restrict");
+    const std::wstring& printSettingsDir = GetSettingsDir();
+    if (!printSettingsDir.empty()) {
+        EnsureSettingsDirExists(printSettingsDir);
+        AppendArg(cmdLine, L"-appdata");
+        AppendQuotedArg(cmdLine, printSettingsDir);
+    }
 
     AppendQuotedArg(cmdLine, fileToPrint);
 
@@ -2517,11 +2745,19 @@ static int DoListPrint(const std::wstring& fileToPrint, const std::wstring& prin
         return LISTPLUGIN_ERROR;
     }
 
+    DWORD printExitCode = 0;
+    const bool haveExitCode = (waitResult == WAIT_OBJECT_0) && GetExitCodeProcess(pi.hProcess, &printExitCode);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
     if (waitResult != WAIT_OBJECT_0) {
         LogF(L"WaitForSingleObject on print process failed, error %lu", GetLastError());
+        return LISTPLUGIN_ERROR;
+    }
+
+    // Sumatra exiting at all is not success: its documented exit codes say whether the job was accepted.
+    if (haveExitCode && printExitCode != 0) {
+        LogF(L"Silent print failed: SumatraPDF exit code %lu -- %ls", printExitCode, DescribePrintExitCode(printExitCode));
         return LISTPLUGIN_ERROR;
     }
 
@@ -2546,7 +2782,7 @@ static bool RelaunchSumatra(ListerInstance* inst)
         return true;
 
     bool opened = TryFallbackShellOpen(inst->filePath);
-    ShowErrorPane(inst->hostWnd, opened ? ERRSTATE_OPENED_EXTERNAL : ERRSTATE_NOT_FOUND);
+    ShowErrorPane(inst->hostWnd, FailureState(inst, opened));
     return false;
 }
 
@@ -2589,6 +2825,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
             TeardownInstance(kv.second.get());
         }
         g_instances.clear(); // drops our shared_ptr refs; frees each ListerInstance once unreferenced
+        // The host window class points at HostWndProc inside this DLL; don't leave it registered with a
+        // dangling procedure once the DLL is gone (it matters if Total Commander unloads and reloads us).
+        UnregisterClassW(HOST_CLASS_NAME, g_hInst);
     }
     return TRUE;
 }
@@ -2666,7 +2905,7 @@ static HWND DoListLoad(HWND ParentWin, const std::wstring& fileName)
 
     if (!LaunchSumatraEmbedded(inst.get())) {
         bool opened = TryFallbackShellOpen(fileName);
-        ShowErrorPane(host, opened ? ERRSTATE_OPENED_EXTERNAL : ERRSTATE_NOT_FOUND);
+        ShowErrorPane(host, FailureState(inst.get(), opened));
     }
 
     return host;
@@ -2726,7 +2965,7 @@ __declspec(dllexport) int __stdcall ListLoadNextW(HWND /*ParentWin*/, HWND ListW
 
     if (!LaunchSumatraEmbedded(inst.get())) {
         bool opened = TryFallbackShellOpen(inst->filePath);
-        ShowErrorPane(inst->hostWnd, opened ? ERRSTATE_OPENED_EXTERNAL : ERRSTATE_NOT_FOUND);
+        ShowErrorPane(inst->hostWnd, FailureState(inst.get(), opened));
         return LISTPLUGIN_ERROR;
     }
     return LISTPLUGIN_OK;
